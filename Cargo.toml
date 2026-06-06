@@ -3,15 +3,16 @@ resolver = "2"
 members = ["crates/core", "crates/cli"]
 
 [workspace.package]
-version = "0.1.0"
-edition = "2021"
+version = "0.1.1"
+edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/skyf0l/sqlx-sqruff"
 rust-version = "1.85"
+readme = "README.md"
 keywords = ["sqlx", "sql", "linter", "formatter", "sqruff"]
 
 [workspace.dependencies]
-sqlx-sqruff-core = { path = "crates/core", version = "0.1.0" }
+sqlx-sqruff-core = { path = "crates/core", version = "0.1.1" }
 # sqruff is 0.x and lightly documented, so isolate it behind the adapter module: a
 # version/source change touches one file. Pinned exactly to the crates.io
 # release so the workspace is publishable (a path/git dep would block publish).

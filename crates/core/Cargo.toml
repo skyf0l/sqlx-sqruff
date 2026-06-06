@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+readme.workspace = true
 description = "Locate and lint/format SQL inside sqlx::query*! macros via embedded sqruff."
 keywords.workspace = true
 categories = ["development-tools", "database"]
