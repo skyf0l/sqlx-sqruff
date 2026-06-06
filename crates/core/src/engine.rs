@@ -1,4 +1,4 @@
-//! Per-file orchestration: check (lint → diagnostics) and fix (fix → writeback).
+//! Per-file orchestration: check (lint -> diagnostics) and fix (fix -> writeback).
 
 use std::cmp::Reverse;
 
@@ -48,7 +48,7 @@ pub fn check_extracted(
         for f in engine.lint(&sql) {
             diags.push(Diagnostic {
                 file: path.to_string(),
-                // SQL line N → .rs line = literal-start line + stripped leading
+                // SQL line N -> .rs line = literal-start line + stripped leading
                 // newlines + (N - 1).
                 line: q.line + lead_newlines + f.line.saturating_sub(1),
                 // dedent removed `indent_len` cols; col is 0-based in SQL.
@@ -123,47 +123,60 @@ pub fn fix_extracted(
 
 /// Reassemble a literal around fixed SQL, preserving its line-shape.
 ///
-/// Line-shape is the author's choice, keyed off the *current* literal: a
-/// multi-line raw block keeps block layout (reindent + preserve framing), so the
-/// way to opt a query into block formatting is to add newlines to its raw
-/// string. Everything else (single-line raw and all normal literals) stays on
-/// one line. Returns `None` when a one-line rebuild would be unsafe (a fix folded
-/// a `--` comment across lines).
+/// Line-shape is the author's choice, keyed off whether the *current* literal
+/// already spans multiple lines: a multi-line literal keeps block layout
+/// (reindent + preserve framing), a one-liner stays on one line. This is
+/// independent of the delimiter kind, since multi-line SQL is common in both raw
+/// (`r#"..."#`) and plain `"..."` strings; the kind is preserved either way (raw
+/// keeps its hashes, normal re-escapes). Returns `None` when a one-line rebuild
+/// would be unsafe (a fix folded a `--` comment across lines).
 fn rebuild_literal(lit: &ParsedLiteral, fixed: &str) -> Option<String> {
-    if let LiteralKind::Raw { hashes } = lit.kind
-        && lit.is_multiline()
-    {
-        let h = "#".repeat(hashes);
-        let indent = literal::block_indent(&lit.content);
-        let body = literal::reindent(fixed, &indent);
+    if lit.is_multiline() {
         // Preserve the original framing verbatim so a no-op fix is a no-op diff
-        // and the closing `"#` stays where the author put it (stuck, or on its
-        // own line).
+        // and the closing delimiter stays where the author put it (stuck, or on
+        // its own line).
         let (leading, trailing) = literal::framing(&lit.content);
-        return Some(format!("r{h}\"{leading}{body}{trailing}\"{h}"));
+        let body = if leading.is_empty() {
+            // First SQL line is stuck to the opening delimiter (`"UPDATE ...`), so
+            // it carries no indent of its own. Keep it flush and align the
+            // continuation lines to the indent the author gave them, rather than
+            // letting the common indent collapse to 0.
+            literal::reindent_keep_first(fixed, &literal::continuation_indent(&lit.content))
+        } else {
+            // Leading newline: every SQL line sits on its own line, so the common
+            // block indent re-applies cleanly to all of them.
+            literal::reindent(fixed, &literal::block_indent(&lit.content))
+        };
+        return Some(wrap(lit, &format!("{leading}{body}{trailing}")));
     }
     rebuild_oneline(lit, fixed)
 }
 
-/// Collapse fixed SQL onto one line, re-emitting in the literal's own delimiter
-/// (raw keeps its hashes; normal re-escapes). `None` when collapsing would fold a
-/// `--` line comment into following code; that one-liner is left untouched.
+/// Collapse fixed SQL onto one line, re-emitting in the literal's own delimiter.
+/// `None` when collapsing would fold a `--` line comment into following code;
+/// that one-liner is left untouched.
 fn rebuild_oneline(lit: &ParsedLiteral, fixed: &str) -> Option<String> {
     let lines: Vec<&str> = fixed.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
     if lines.len() > 1 && fixed.contains("--") {
         return None;
     }
-    let one = lines.join(" ");
-    Some(match lit.kind {
+    Some(wrap(lit, &lines.join(" ")))
+}
+
+/// Wrap inner SQL in the literal's own delimiter: raw keeps its hashes, normal
+/// re-escapes `\` and `"`. Literal newlines in `inner` are left intact for both
+/// (valid in raw and in multi-line normal strings alike).
+fn wrap(lit: &ParsedLiteral, inner: &str) -> String {
+    match lit.kind {
         LiteralKind::Raw { hashes } => {
             let h = "#".repeat(hashes);
-            format!("r{h}\"{one}\"{h}")
+            format!("r{h}\"{inner}\"{h}")
         }
         LiteralKind::Normal => {
-            let escaped = one.replace('\\', "\\\\").replace('"', "\\\"");
+            let escaped = inner.replace('\\', "\\\\").replace('"', "\\\"");
             format!("\"{escaped}\"")
         }
-    })
+    }
 }
 
 fn leading_newlines(content: &str) -> usize {
@@ -218,7 +231,7 @@ mod tests {
     #[test]
     fn inline_style_noop_is_byte_identical() {
         // SQL stuck to opening `r#"` and closing `"#` stuck to last line; safe-fix
-        // has nothing to change → output must equal input (no added newline).
+        // has nothing to change -> output must equal input (no added newline).
         let src = "fn f(){\n    sqlx::query!(r#\"INSERT INTO t\n           (a, b)\n           VALUES ($1, $2)\"#, x, y);\n}\n";
         let eng = engine();
         let out = fix_file("f.rs", src, &eng).unwrap();
@@ -254,6 +267,39 @@ mod tests {
         assert!(out.contains("IS NULL"));
         // stays a multi-line block (opening `r#"` then a newline).
         assert!(out.contains("r#\"\n"), "got: {out}");
+    }
+
+    #[test]
+    fn multiline_normal_string_stays_multiline() {
+        // A hand-formatted multi-line *normal* `"..."` string (no `r#`) must keep
+        // its block layout, not get collapsed onto one line.
+        let src = "fn f(){\n    let _=sqlx::query!(\n        \"SELECT a\n        FROM t\n        WHERE x = NULL\",\n        p,\n    );\n}\n";
+        let eng = engine();
+        let out = fix_file("f.rs", src, &eng).unwrap().new_src.expect("should change");
+        assert!(out.contains("IS NULL"));
+        // still spans multiple lines (a newline survives inside the literal).
+        assert!(out.matches('\n').count() >= 6, "collapsed to one line: {out}");
+    }
+
+    #[test]
+    fn stuck_first_line_keeps_continuation_indent() {
+        // First SQL line stuck to the opening quote; continuation lines indented
+        // 8 spaces. After fixing, that 8-space alignment must be preserved (not
+        // collapsed to column 0).
+        let src = "fn f(){\n    let _=sqlx::query!(\n        \"SELECT a\n        FROM t\n        WHERE x = NULL\",\n        p,\n    );\n}\n";
+        let eng = engine();
+        let out = fix_file("f.rs", src, &eng).unwrap().new_src.expect("should change");
+        assert!(out.contains("        FROM t"), "lost continuation indent: {out}");
+        assert!(out.contains("        WHERE x IS NULL"), "lost continuation indent: {out}");
+    }
+
+    #[test]
+    fn multiline_normal_fix_is_idempotent() {
+        let src = "fn f(){\n    let _=sqlx::query!(\n        \"SELECT a\n        FROM t\n        WHERE x = NULL\",\n        p,\n    );\n}\n";
+        let eng = engine();
+        let fixed = fix_file("f.rs", src, &eng).unwrap().new_src.expect("should change");
+        let second = fix_file("f.rs", &fixed, &eng).unwrap();
+        assert!(second.new_src.is_none(), "second run must be a no-op");
     }
 
     #[test]

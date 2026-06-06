@@ -74,9 +74,9 @@ Since the rules and `.sqruff` format are sqruff's, see its docs directly:
 
 ## Architecture
 
-`crates/core` (library): `extract` (syn + proc-macro2 span → literal byte spans)
-→ `literal` (dedent/reindent) → `sqruff_adapter` (the only file touching
-`sqruff-lib`) → `engine` (check/fix + writeback with a re-parse safety
+`crates/core` (library): `extract` (syn + proc-macro2 span -> literal byte spans)
+-> `literal` (dedent/reindent) -> `sqruff_adapter` (the only file touching
+`sqruff-lib`) -> `engine` (check/fix + writeback with a re-parse safety
 invariant). `crates/cli` is a thin clap front-end.
 
 ## Known limitations

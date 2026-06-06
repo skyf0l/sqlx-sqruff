@@ -111,6 +111,46 @@ pub fn reindent(sql: &str, indent: &str) -> String {
         .join("\n")
 }
 
+/// Common leading indent of the *continuation* lines (every line after the
+/// first). Used to re-indent a literal whose first line is stuck to the opening
+/// delimiter and so carries no indentation of its own.
+pub fn continuation_indent(content: &str) -> String {
+    content
+        .lines()
+        .skip(1)
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.get(..leading_ws_len(l)).unwrap_or("").to_string())
+        .min_by_key(|s| s.len())
+        .unwrap_or_default()
+}
+
+/// Re-indent `sql` for a literal whose first line is stuck to the opening
+/// delimiter: the first line stays flush, and each remaining line is first
+/// dedented to column 0 (so the result is independent of however the linter
+/// indented its output) then prefixed with `indent`.
+pub fn reindent_keep_first(sql: &str, indent: &str) -> String {
+    let mut lines = sql.trim_end_matches('\n').lines();
+    let Some(first) = lines.next() else {
+        return String::new();
+    };
+    let rest: Vec<&str> = lines.collect();
+    let min = rest
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| leading_ws_len(l))
+        .min()
+        .unwrap_or(0);
+    let mut out = first.to_string();
+    for l in rest {
+        out.push('\n');
+        if !l.trim().is_empty() {
+            out.push_str(indent);
+            out.push_str(l.get(min..).unwrap_or(l));
+        }
+    }
+    out
+}
+
 fn leading_ws_len(l: &str) -> usize {
     l.len() - l.trim_start().len()
 }

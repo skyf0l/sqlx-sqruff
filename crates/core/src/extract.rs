@@ -41,7 +41,7 @@ pub fn extract_checked(src: &str) -> Result<Vec<QueryLiteral>, String> {
     // In a typical codebase most `.rs` files hold no `query*!` macro, so this
     // skips the bulk of the parsing work. A file that fails to parse but
     // contains no "query" is reported as having no queries (Ok-empty), never as
-    // skipped — which is the correct outcome.
+    // skipped, which is the correct outcome.
     if !src.contains("query") {
         return Ok(Vec::new());
     }
@@ -175,7 +175,7 @@ fn f() {
 
     #[test]
     fn pre_filter_skips_query_free_files_without_parsing() {
-        // No "query" substring → Ok-empty without invoking syn, even if the file
+        // No "query" substring -> Ok-empty without invoking syn, even if the file
         // would not parse. Such files are never reported as skipped/unparsable.
         assert!(extract_checked("this is not rust {{{").unwrap().is_empty());
         assert!(extract_checked("fn f() { let x = 1; }").unwrap().is_empty());
@@ -183,7 +183,7 @@ fn f() {
 
     #[test]
     fn pre_filter_still_errors_on_unparsable_file_with_query() {
-        // Contains "query" → syn must still run, so a genuine parse failure is
+        // Contains "query" -> syn must still run, so a genuine parse failure is
         // surfaced (the CLI turns this into a skip warning).
         assert!(extract_checked("query! this is not rust {{{").is_err());
     }

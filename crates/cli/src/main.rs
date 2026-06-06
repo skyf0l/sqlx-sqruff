@@ -122,7 +122,7 @@ fn cmd_check(a: CheckArgs) -> Result<ExitCode> {
         let src = std::fs::read_to_string(&path)?;
         let p = path.display().to_string();
         // Parse once: extract_checked both surfaces the syn error (for the skip
-        // warning) and yields the queries check_extracted needs — no second parse.
+        // warning) and yields the queries check_extracted needs, with no reparse.
         let queries = match extract_checked(&src) {
             Ok(q) => q,
             Err(e) => {
