@@ -35,6 +35,16 @@ pub fn extract(src: &str) -> Vec<QueryLiteral> {
 /// Like [`extract`], but returns the `syn` parse error so callers can warn that
 /// a whole file was skipped (rather than hiding its queries).
 pub fn extract_checked(src: &str) -> Result<Vec<QueryLiteral>, String> {
+    // Cheap byte-substring gate before the expensive `syn::parse_file`: every
+    // supported macro name (`query`, `query_as`, …) contains "query", so a file
+    // without that substring has no inline SQL and need not be parsed at all.
+    // In a typical codebase most `.rs` files hold no `query*!` macro, so this
+    // skips the bulk of the parsing work. A file that fails to parse but
+    // contains no "query" is reported as having no queries (Ok-empty), never as
+    // skipped — which is the correct outcome.
+    if !src.contains("query") {
+        return Ok(Vec::new());
+    }
     let file = syn::parse_file(src).map_err(|e| e.to_string())?;
     let mut v = Visitor { found: Vec::new() };
     v.visit_file(&file);
@@ -161,5 +171,20 @@ fn f() {
     #[test]
     fn ignores_unparsable_file() {
         assert!(extract("this is not rust {{{").is_empty());
+    }
+
+    #[test]
+    fn pre_filter_skips_query_free_files_without_parsing() {
+        // No "query" substring → Ok-empty without invoking syn, even if the file
+        // would not parse. Such files are never reported as skipped/unparsable.
+        assert!(extract_checked("this is not rust {{{").unwrap().is_empty());
+        assert!(extract_checked("fn f() { let x = 1; }").unwrap().is_empty());
+    }
+
+    #[test]
+    fn pre_filter_still_errors_on_unparsable_file_with_query() {
+        // Contains "query" → syn must still run, so a genuine parse failure is
+        // surfaced (the CLI turns this into a skip warning).
+        assert!(extract_checked("query! this is not rust {{{").is_err());
     }
 }

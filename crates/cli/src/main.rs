@@ -13,7 +13,8 @@ use std::{
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use sqlx_sqruff_core::{
-    engine::{check_file, fix_file},
+    engine::{check_extracted, fix_extracted},
+    extract::extract_checked,
     sqruff_adapter::SqruffEngine,
 };
 use walkdir::WalkDir;
@@ -123,11 +124,17 @@ fn cmd_check(a: CheckArgs) -> Result<ExitCode> {
     for path in rust_files(&a.paths) {
         let src = std::fs::read_to_string(&path)?;
         let p = path.display().to_string();
-        if warn_unparsable(&p, &src) {
-            skipped += 1;
-            continue;
-        }
-        for d in check_file(&p, &src, &engine) {
+        // Parse once: extract_checked both surfaces the syn error (for the skip
+        // warning) and yields the queries check_extracted needs — no second parse.
+        let queries = match extract_checked(&src) {
+            Ok(q) => q,
+            Err(e) => {
+                warn_skip(&p, &e);
+                skipped += 1;
+                continue;
+            }
+        };
+        for d in check_extracted(&p, &queries, &engine) {
             total += 1;
             match a.format {
                 OutFmt::Human => println!("{}", d.render_human()),
@@ -139,17 +146,11 @@ fn cmd_check(a: CheckArgs) -> Result<ExitCode> {
     Ok(if total == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE })
 }
 
-/// Warn (once) when a file can't be parsed by `syn`, so whole-file skips are
-/// visible, never silent. Returns true if the file should be skipped.
-fn warn_unparsable(path: &str, src: &str) -> bool {
-    match sqlx_sqruff_core::extract::extract_checked(src) {
-        Ok(_) => false,
-        Err(e) => {
-            let first = e.lines().next().unwrap_or("parse error");
-            eprintln!("warning: skipping {path} (unparsable by syn): {first}");
-            true
-        }
-    }
+/// Warn when a file can't be parsed by `syn`, so whole-file skips are visible,
+/// never silent. `err` is the `extract_checked` parse error.
+fn warn_skip(path: &str, err: &str) {
+    let first = err.lines().next().unwrap_or("parse error");
+    eprintln!("warning: skipping {path} (unparsable by syn): {first}");
 }
 
 fn cmd_fix(a: FixArgs) -> Result<ExitCode> {
@@ -160,11 +161,17 @@ fn cmd_fix(a: FixArgs) -> Result<ExitCode> {
     for path in rust_files(&a.paths) {
         let src = std::fs::read_to_string(&path)?;
         let p = path.display().to_string();
-        if warn_unparsable(&p, &src) {
-            skipped += 1;
-            continue;
-        }
-        match fix_file(&p, &src, &engine, !a.all_literals) {
+        // Parse once (see cmd_check): extract_checked feeds both the skip warning
+        // and fix_extracted.
+        let queries = match extract_checked(&src) {
+            Ok(q) => q,
+            Err(e) => {
+                warn_skip(&p, &e);
+                skipped += 1;
+                continue;
+            }
+        };
+        match fix_extracted(&p, &src, &queries, &engine, !a.all_literals) {
             Ok(out) => {
                 if let Some(new_src) = out.new_src {
                     changed_files += 1;

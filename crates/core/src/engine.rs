@@ -2,7 +2,7 @@
 
 use crate::{
     diagnostic::Diagnostic,
-    extract::extract,
+    extract::{QueryLiteral, extract},
     literal::{self, LiteralKind, ParsedLiteral},
     sqruff_adapter::SqruffEngine,
 };
@@ -19,9 +19,21 @@ pub fn dump_file(src: &str) -> Vec<(usize, String)> {
 }
 
 /// Lint every inline query in `src`; map findings to `.rs` locations.
+/// Convenience wrapper that extracts then lints (used by tests). The CLI calls
+/// [`extract_checked`](crate::extract::extract_checked) once and then
+/// [`check_extracted`] directly, to avoid parsing each file twice.
 pub fn check_file(path: &str, src: &str, engine: &SqruffEngine) -> Vec<Diagnostic> {
+    check_extracted(path, &extract(src), engine)
+}
+
+/// Lint pre-extracted queries; map findings to `.rs` locations.
+pub fn check_extracted(
+    path: &str,
+    queries: &[QueryLiteral],
+    engine: &SqruffEngine,
+) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
-    for q in extract(src) {
+    for q in queries {
         let Some(lit) = ParsedLiteral::parse(&q.text) else {
             continue;
         };
@@ -55,14 +67,29 @@ pub struct FixOutcome {
 /// Fix every (multi-line raw, unless `all`) inline query and splice back.
 /// Returns `None` for `new_src` if nothing changed; never returns a `.rs` that
 /// fails to re-parse (safety invariant).
+///
+/// Convenience wrapper that extracts then fixes (used by tests). The CLI calls
+/// [`extract_checked`](crate::extract::extract_checked) once and then
+/// [`fix_extracted`] directly, to avoid parsing each file twice.
 pub fn fix_file(
     path: &str,
     src: &str,
     engine: &SqruffEngine,
     only_multiline_raw: bool,
 ) -> Result<FixOutcome, String> {
+    fix_extracted(path, src, &extract(src), engine, only_multiline_raw)
+}
+
+/// Fix pre-extracted queries and splice back into `src`.
+pub fn fix_extracted(
+    path: &str,
+    src: &str,
+    queries: &[QueryLiteral],
+    engine: &SqruffEngine,
+    only_multiline_raw: bool,
+) -> Result<FixOutcome, String> {
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
-    for q in extract(src) {
+    for q in queries {
         let Some(lit) = ParsedLiteral::parse(&q.text) else {
             continue;
         };
