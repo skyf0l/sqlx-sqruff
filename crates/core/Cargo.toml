@@ -1,0 +1,17 @@
+[package]
+name = "sqlx-sqruff-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Locate and lint/format SQL inside sqlx::query*! macros via embedded sqruff."
+keywords.workspace = true
+categories = ["development-tools", "database"]
+
+[dependencies]
+sqruff-lib.workspace = true
+sqruff-lib-core.workspace = true
+syn.workspace = true
+proc-macro2.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/skyf0l/sqlx-sqruff"
+rust-version = "1.85"
+keywords = ["sqlx", "sql", "linter", "formatter", "sqruff"]
+
+[workspace.dependencies]
+sqlx-sqruff-core = { path = "crates/core", version = "0.1.0" }
+# sqruff is 0.x and lightly documented, so isolate it behind the adapter module: a
+# version/source change touches one file. Pinned exactly to the crates.io
+# release so the workspace is publishable (a path/git dep would block publish).
+sqruff-lib = "=0.38.0"
+sqruff-lib-core = "=0.38.0"
+syn = { version = "2", features = ["full", "visit", "extra-traits"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+clap = { version = "4", features = ["derive"] }
+walkdir = "2"
+anyhow = "1"
+thiserror = "2"

@@ -1,0 +1,20 @@
+[package]
+name = "sqlx-sqruff"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Lint and format SQL inside sqlx::query*! macros (sqruff-powered)."
+keywords.workspace = true
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "sqlx-sqruff"
+path = "src/main.rs"
+
+[dependencies]
+sqlx-sqruff-core.workspace = true
+clap.workspace = true
+walkdir.workspace = true
+anyhow.workspace = true
