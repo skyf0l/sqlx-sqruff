@@ -36,7 +36,7 @@ pub fn extract(src: &str) -> Vec<QueryLiteral> {
 /// a whole file was skipped (rather than hiding its queries).
 pub fn extract_checked(src: &str) -> Result<Vec<QueryLiteral>, String> {
     // Cheap byte-substring gate before the expensive `syn::parse_file`: every
-    // supported macro name (`query`, `query_as`, …) contains "query", so a file
+    // supported macro name (`query`, `query_as`, ...) contains "query", so a file
     // without that substring has no inline SQL and need not be parsed at all.
     // In a typical codebase most `.rs` files hold no `query*!` macro, so this
     // skips the bulk of the parsing work. A file that fails to parse but
@@ -85,7 +85,7 @@ fn is_query_macro(path: &syn::Path) -> bool {
 }
 
 /// First string literal in the token stream; naturally skips a leading struct
-/// ident + comma (`query_as!(Row, r#"…"#)`) and stops before bind-arg literals.
+/// ident + comma (`query_as!(Row, r#"..."#)`) and stops before bind-arg literals.
 fn first_string_literal(tokens: proc_macro2::TokenStream) -> Option<Literal> {
     for tt in tokens {
         if let TokenTree::Literal(l) = tt {

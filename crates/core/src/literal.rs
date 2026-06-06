@@ -5,9 +5,9 @@
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiteralKind {
-    /// `r#"…"#` with `hashes` `#` characters (0 for `r"…"`).
+    /// `r#"..."#` with `hashes` `#` characters (0 for `r"..."`).
     Raw { hashes: usize },
-    /// `"…"` with backslash escapes.
+    /// `"..."` with backslash escapes.
     Normal,
 }
 
@@ -24,7 +24,7 @@ impl ParsedLiteral {
         if let Some(rest) = text.strip_prefix('r') {
             let hashes = rest.chars().take_while(|&c| c == '#').count();
             let open = rest.get(hashes..)?.strip_prefix('"')?;
-            let close: String = std::iter::repeat('#').take(hashes).collect();
+            let close = "#".repeat(hashes);
             // closing delimiter is `"` + hashes, at the very end of the token
             let inner = open
                 .strip_suffix(&format!("\"{close}"))
@@ -33,10 +33,6 @@ impl ParsedLiteral {
         }
         let inner = text.strip_prefix('"')?.strip_suffix('"')?;
         Some(Self { kind: LiteralKind::Normal, content: unescape(inner) })
-    }
-
-    pub fn is_raw(&self) -> bool {
-        matches!(self.kind, LiteralKind::Raw { .. })
     }
 
     pub fn is_multiline(&self) -> bool {
@@ -161,7 +157,7 @@ mod tests {
 
     #[test]
     fn framing_inline_style_keeps_closing_stuck() {
-        // `r#"INSERT …\n   VALUES (…)"#`, no leading/trailing newline.
+        // `r#"INSERT ...\n   VALUES (...)"#`, no leading/trailing newline.
         let c = "INSERT INTO t\n           VALUES (1)";
         assert_eq!(framing(c), (String::new(), String::new()));
     }

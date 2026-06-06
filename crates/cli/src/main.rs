@@ -67,9 +67,6 @@ struct FixArgs {
     /// Don't write; exit non-zero if changes are needed.
     #[arg(long)]
     check: bool,
-    /// Also fix single-line `"…"` literals (default: only multi-line raw).
-    #[arg(long)]
-    all_literals: bool,
 }
 
 #[derive(Parser)]
@@ -171,7 +168,7 @@ fn cmd_fix(a: FixArgs) -> Result<ExitCode> {
                 continue;
             }
         };
-        match fix_extracted(&p, &src, &queries, &engine, !a.all_literals) {
+        match fix_extracted(&p, &src, &queries, &engine) {
             Ok(out) => {
                 if let Some(new_src) = out.new_src {
                     changed_files += 1;

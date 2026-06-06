@@ -48,8 +48,11 @@ Shared flags on `check` / `fix`:
 - `--config FILE`: explicit sqruff config (otherwise a `.sqruff` is auto-discovered).
 - `--dialect NAME`: SQL dialect injected into the config (default `postgres`).
 
-`fix` also takes `--all-literals` to fix single-line `"…"` literals (default:
-only multi-line raw strings).
+`fix` cleans every query in place and **preserves each literal's line-shape**:
+one-liners stay on one line, multi-line raw blocks keep block layout. Line-shape
+is yours to choose. To opt a query into block formatting, write it across
+multiple lines in a raw string (`r#"`...`"#`) and re-run `fix`; to keep it compact,
+keep it on one line.
 
 ### Config resolution
 
@@ -67,7 +70,7 @@ sqlx queries.
 Since the rules and `.sqruff` format are sqruff's, see its docs directly:
 
 - [Configuration](https://playground.quary.dev/docs/usage/configuration/): `.sqruff` format, sections, per-rule options.
-- [Rules reference](https://playground.quary.dev/docs/reference/rules/): every rule code (`CP01`, `LT01`, …) and what it does.
+- [Rules reference](https://playground.quary.dev/docs/reference/rules/): every rule code (`CP01`, `LT01`, ...) and what it does.
 
 ## Architecture
 
@@ -80,13 +83,13 @@ invariant). `crates/cli` is a thin clap front-end.
 
 - **Macros only, not the function API.** Only the `sqlx::query*!` **macros**
   (`query!`, `query_as!`, `query_scalar!`, and their `_unchecked` variants) are
-  extracted. The runtime function forms (`sqlx::query("…")`,
-  `sqlx::query_as::<_, T>("…")`) are plain function calls with no `!`, so they
+  extracted. The runtime function forms (`sqlx::query("...")`,
+  `sqlx::query_as::<_, T>("...")`) are plain function calls with no `!`, so they
   are silently ignored. Their SQL is typically built dynamically (`format!`,
   concatenation, conditional fragments), which can't be reliably extracted or
   safely auto-fixed in the first place.
 - **The SQL must be a single string literal.** The query is read from one
-  string literal, so a query string assembled some other way (a `concat!(…)`,
+  string literal, so a query string assembled some other way (a `concat!(...)`,
   a `const`, or runtime concatenation) is not extracted. Bind-argument literals
   that follow the SQL are correctly left alone.
 - **Whole-file skip on unparsable Rust.** If `syn` can't parse a file, it is
