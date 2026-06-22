@@ -21,6 +21,8 @@ sqruff-lib-core = "=0.38.0"
 syn = { version = "2", features = ["full", "visit", "extra-traits"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 clap = { version = "4", features = ["derive"] }
-walkdir = "2"
+# File discovery: gitignore-aware walking + include/exclude override globs in one
+# crate (re-exports globset). Replaces a bare walkdir walk in the CLI.
+ignore = "0.4"
 anyhow = "1"
 thiserror = "2"
