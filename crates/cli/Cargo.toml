@@ -17,5 +17,5 @@ path = "src/main.rs"
 [dependencies]
 sqlx-sqruff-core.workspace = true
 clap.workspace = true
-walkdir.workspace = true
+ignore.workspace = true
 anyhow.workspace = true

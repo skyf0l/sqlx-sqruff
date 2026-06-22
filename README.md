@@ -72,6 +72,40 @@ Since the rules and `.sqruff` format are sqruff's, see its docs directly:
 - [Configuration](https://playground.quary.dev/docs/usage/configuration/): `.sqruff` format, sections, per-rule options.
 - [Rules reference](https://playground.quary.dev/docs/reference/rules/): every rule code (`CP01`, `LT01`, ...) and what it does.
 
+### Selecting which files to scan
+
+By default every `.rs` file under the search roots is scanned, respecting
+`.gitignore` / `.ignore` / `.git/info/exclude`. To persist a project's scope,
+add a **`[sqlx-sqruff]`** section to your `.sqruff`. sqruff itself ignores this
+section (it only reads `sqruff` / `sqruff:*`), so it is consumed solely by this
+CLI:
+
+```ini
+[sqruff]
+dialect = postgres
+
+# CLI-only: which .rs files this tool walks.
+[sqlx-sqruff]
+include = src/**/*.rs, crates/**/*.rs   # whitelist (comma-separated globs)
+exclude = **/generated/**                # always pruned
+respect_gitignore = true                 # default; set false to ignore VCS ignores
+```
+
+Selection rules:
+
+| `include` | `exclude` | Result |
+| --------- | --------- | ------ |
+| unset | unset | every `.rs` (respecting `.gitignore`) |
+| set | unset | only files matching `include` |
+| unset | set | every `.rs` minus `exclude` |
+| set | set | `include` minus `exclude` |
+
+- **Explicit positional paths win.** `sqlx-sqruff check src/foo` scans `src/foo`
+  and ignores `include` (you've named your own scope); `exclude` and
+  `.gitignore` still prune. A directly-named **file** is always scanned.
+- Globs are gitignore-style (`**` spans directories), matched relative to the
+  search root.
+
 ## Architecture
 
 `crates/core` (library): `extract` (syn + proc-macro2 span -> literal byte spans)
