@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/core", "crates/cli"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/skyf0l/sqlx-sqruff"
@@ -16,9 +16,9 @@ sqlx-sqruff-core = { path = "crates/core", version = "0.2.0" }
 # sqruff is 0.x and lightly documented, so isolate it behind the adapter module: a
 # version/source change touches one file. Pinned exactly to the crates.io
 # release so the workspace is publishable (a path/git dep would block publish).
-sqruff-lib = "=0.38.0"
-sqruff-lib-core = "=0.38.0"
-syn = { version = "2", features = ["full", "visit", "extra-traits"] }
+sqruff-lib = "=0.39.0"
+sqruff-lib-core = "=0.39.0"
+syn = { version = "3", features = ["full", "visit", "extra-traits"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 clap = { version = "4", features = ["derive"] }
 # File discovery: gitignore-aware walking + include/exclude override globs in one
