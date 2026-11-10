@@ -6,13 +6,24 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 readme.workspace = true
-description = "Lint and format SQL inside sqlx::query*! macros (sqruff-powered)."
+description = "Lint and format SQL inside sqlx::query*! macros and sqlx::query*() calls (sqruff-powered)."
 keywords.workspace = true
 categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "sqlx-sqruff"
 path = "src/main.rs"
+
+# Must match the archives the Release workflow uploads: `$bin-$target.tar.gz`
+# (`.zip` on Windows) with the binary at the archive root.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.zip"
+pkg-fmt = "zip"
 
 [dependencies]
 sqlx-sqruff-core.workspace = true
