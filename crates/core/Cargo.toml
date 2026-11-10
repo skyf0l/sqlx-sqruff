@@ -1,12 +1,14 @@
 [package]
 name = "sqlx-sqruff-core"
-version.workspace = true
+# Versioned on its own: the CLI is the stable interface, this library is its
+# engine and makes no API stability promise.
+version = "0.3.0-rc.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 readme.workspace = true
-description = "Locate and lint/format SQL inside sqlx::query*! macros via embedded sqruff."
+description = "Locate and lint/format SQL inside sqlx::query*! macros and sqlx::query*() calls via embedded sqruff."
 keywords.workspace = true
 categories = ["development-tools", "database"]
 
@@ -15,4 +17,4 @@ sqruff-lib.workspace = true
 sqruff-lib-core.workspace = true
 syn.workspace = true
 proc-macro2.workspace = true
-thiserror.workspace = true
+serde_json.workspace = true

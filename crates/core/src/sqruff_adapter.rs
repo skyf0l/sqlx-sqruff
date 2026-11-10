@@ -1,19 +1,36 @@
 //! The ONLY module that touches `sqruff-lib`. Keep the surface tiny so an
 //! upgrade of the pinned (0.x) sqruff crates touches one file.
 //!
-//! Config follows sqruff's NATIVE behaviour: `discover()` uses
-//! `FluffConfig::from_root`, which finds a project `.sqruff` (and applies
-//! sqruff's own default rules when none exists), exactly like the `sqruff`
-//! binary. The tool embeds NO rule presets. The single injected default is the
-//! dialect: sqruff defaults to `ansi`, which mis-parses the majority of
-//! postgres sqlx queries, so we override it (overridable via `--dialect`).
+//! Config follows sqruff's NATIVE behaviour: `discover()` loads the same config
+//! stack as the `sqruff` binary (user config directory, home, the ancestors of
+//! the working directory and the working directory itself, with an explicit
+//! `--config` file applied on top), and sqruff's own default rules apply when
+//! no config sets `rules`. The tool embeds NO rule presets. The single injected
+//! default is the dialect: sqruff defaults to `ansi`, which mis-parses the
+//! majority of postgres sqlx queries, so `postgres` is used when neither
+//! `--dialect` nor the config sets one.
 
-use std::path::Path;
+use std::{
+    any::Any,
+    cell::Cell,
+    panic::{self, AssertUnwindSafe},
+    path::Path,
+    str::FromStr,
+    sync::Once,
+};
 
-use sqruff_lib::core::{config::FluffConfig, linter::core::Linter};
-use sqruff_lib_core::{dialects::init::DialectKind, errors::SQLBaseError};
+use sqruff_lib::core::{
+    config::{ConfigLoader, FluffConfig, Value},
+    linter::core::Linter,
+};
+use sqruff_lib_core::{
+    config::ConfigMap,
+    dialects::init::{DialectKind, dialect_readout},
+    errors::SQLBaseError,
+};
 
-/// A single lint finding, 1-based line / 0-based col *within the dedented SQL*.
+/// A single lint finding, 1-based line / 1-based col in chars *within the SQL
+/// given to sqruff*.
 #[derive(Debug, Clone)]
 pub struct Finding {
     pub code: String,
@@ -21,6 +38,9 @@ pub struct Finding {
     pub col: usize,
     pub desc: String,
     pub fixable: bool,
+    /// A lexing or parsing error rather than a rule violation: part of the SQL
+    /// did not parse with the configured dialect.
+    pub unparsable: bool,
 }
 
 impl From<&SQLBaseError> for Finding {
@@ -31,6 +51,7 @@ impl From<&SQLBaseError> for Finding {
             col: e.line_pos,
             desc: e.desc().to_string(),
             fixable: e.fixable,
+            unparsable: e.rule.is_none(),
         }
     }
 }
@@ -41,72 +62,179 @@ pub struct SqruffEngine {
 
 impl SqruffEngine {
     /// Production path: sqruff-native config discovery.
-    /// - `extra_config`: an explicit config file (`--config`), or None.
-    /// - `.sqruff` in the cwd / ancestors is discovered automatically.
-    /// - `dialect` is injected as an override (default `postgres`).
-    pub fn discover(dialect: &str, extra_config: Option<&Path>) -> Result<Self, String> {
-        // `from_root` IGNORES an extra_config_path unless ignore_local_config is
-        // set, so load an explicit `--config` directly with `from_file`; reserve
-        // `from_root` for sqruff-native discovery (`.sqruff` walk + defaults).
-        let mut cfg = match extra_config {
-            Some(path) => FluffConfig::from_file(path),
-            None => FluffConfig::from_root(None, false, None).map_err(|e| format!("{e:?}"))?,
+    /// - `.sqruff` (and the other files sqruff reads) in the user config
+    ///   directory, home, the cwd and its ancestors are discovered automatically.
+    /// - `extra_config`: an explicit config file (`--config`) applied on top of
+    ///   the discovered ones, or None.
+    /// - `dialect` (`--dialect`) overrides the config's dialect; with neither,
+    ///   `postgres` is used.
+    pub fn discover(dialect: Option<&str>, extra_config: Option<&Path>) -> Result<Self, String> {
+        let extra_config = extra_config
+            .map(|path| {
+                path.to_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("config path {} is not valid UTF-8", path.display()))
+            })
+            .transpose()?;
+        let raw = ConfigLoader
+            .try_load_config_up_to_path(Path::new("."), extra_config, false)
+            .map_err(|e| e.to_string())?;
+        let configured = configured_dialect(raw.get("core"))?;
+        let dialect = match (dialect, configured) {
+            (Some(name), _) => Some(parse_dialect(name)?),
+            (None, None) => Some(DialectKind::Postgres),
+            (None, Some(_)) => None,
         };
-        cfg.override_dialect(parse_dialect(dialect)?)?;
-        Self::with_config(cfg)
+        Self::build(raw, dialect)
     }
 
     /// Build from an explicit config string (tests, or callers that hold their
     /// own `.sqruff` text). The string must set `dialect`.
     pub fn from_source(config_src: &str) -> Result<Self, String> {
-        Self::with_config(FluffConfig::from_source(config_src, None))
+        let raw = ConfigLoader::try_from_source(config_src, None).map_err(|e| e.to_string())?;
+        configured_dialect(raw.get("core"))?;
+        Self::build(raw, None)
     }
 
-    fn with_config(config: FluffConfig) -> Result<Self, String> {
-        let linter = Linter::new(config, None, None, true)?;
+    /// `raw` must hold no dialect name that `DialectKind` rejects, because
+    /// sqruff panics on one while building the config.
+    fn build(raw: ConfigMap, dialect: Option<DialectKind>) -> Result<Self, String> {
+        let linter = without_panicking(move || {
+            let mut config = FluffConfig::new(raw, None, None);
+            if let Some(kind) = dialect {
+                config.override_dialect(kind)?;
+            }
+            Linter::new(config, None, None, true)
+        })??;
+        // A config-level problem such as an unknown rule code makes every lint
+        // fail, so report it once here instead of once per query.
+        linter.lint_string("SELECT 1\n", None, false).map_err(|e| e.to_string())?;
         Ok(Self { linter })
     }
 
-    /// Lint only.
-    pub fn lint(&self, sql: &str) -> Vec<Finding> {
-        match self.linter.lint_string(sql, None, false) {
-            Ok(lf) => lf.violations().iter().map(Finding::from).collect(),
-            Err(_) => Vec::new(),
-        }
+    /// Lint only. `Err` carries sqruff's message when it cannot process `sql`
+    /// at all (for example an invalid inline `-- sqruff:` config line).
+    pub fn lint(&self, sql: &str) -> Result<Vec<Finding>, String> {
+        let lf = self.linter.lint_string(sql, None, false).map_err(|e| e.to_string())?;
+        Ok(lf.violations().iter().map(Finding::from).collect())
     }
 
-    /// Fix; returns `(fixed_sql, residual_unfixable_findings)`.
-    pub fn fix(&self, sql: &str) -> (String, Vec<Finding>) {
-        match self.linter.lint_string(sql, None, true) {
-            Ok(lf) => {
-                let residual =
-                    lf.violations().iter().filter(|v| !v.fixable).map(Finding::from).collect();
-                (lf.fix_string(), residual)
-            }
-            Err(_) => (sql.to_string(), Vec::new()),
-        }
+    /// Fix; returns `(fixed_sql, residual_unfixable_findings)`, or sqruff's
+    /// message as in [`lint`](Self::lint).
+    pub fn fix(&self, sql: &str) -> Result<(String, Vec<Finding>), String> {
+        let lf = self.linter.lint_string(sql, None, true).map_err(|e| e.to_string())?;
+        let residual = lf.violations().iter().filter(|v| !v.fixable).map(Finding::from).collect();
+        Ok((lf.fix_string(), residual))
     }
 }
 
-fn parse_dialect(s: &str) -> Result<DialectKind, String> {
-    use DialectKind::*;
-    Ok(match s.to_ascii_lowercase().as_str() {
-        "ansi" => Ansi,
-        "athena" => Athena,
-        "bigquery" => Bigquery,
-        "clickhouse" => Clickhouse,
-        "databricks" => Databricks,
-        "db2" => Db2,
-        "duckdb" => Duckdb,
-        "mysql" => Mysql,
-        "oracle" => Oracle,
-        "postgres" => Postgres,
-        "redshift" => Redshift,
-        "snowflake" => Snowflake,
-        "sparksql" => Sparksql,
-        "sqlite" => Sqlite,
-        "trino" => Trino,
-        "tsql" => Tsql,
-        other => return Err(format!("unknown dialect '{other}'")),
+/// Run `build`, turning a panic into an error: sqruff panics on some invalid
+/// config values instead of returning an error.
+fn without_panicking<T>(build: impl FnOnce() -> T) -> Result<T, String> {
+    // The panic hook is process-wide, so swapping it per call would silence
+    // other threads too, or leave it silent when two calls overlap. Wrap the
+    // installed hook once instead, and mute it only on this thread.
+    thread_local! {
+        static MUTED: Cell<bool> = const { Cell::new(false) };
+    }
+    static WRAP_HOOK: Once = Once::new();
+    WRAP_HOOK.call_once(|| {
+        let hook = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            if !MUTED.get() {
+                hook(info);
+            }
+        }));
+    });
+    MUTED.set(true);
+    let result = panic::catch_unwind(AssertUnwindSafe(build));
+    MUTED.set(false);
+    result.map_err(|payload| format!("invalid sqruff config: {}", panic_message(payload.as_ref())))
+}
+
+fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown error")
+}
+
+/// The dialect set in a loaded config's `core` section (`[sqruff] dialect`), if
+/// any, accepted exactly as sqruff accepts it.
+fn configured_dialect(core: Option<&Value>) -> Result<Option<DialectKind>, String> {
+    let Some(Value::String(name)) = core.and_then(Value::as_map).and_then(|c| c.get("dialect"))
+    else {
+        return Ok(None);
+    };
+    DialectKind::from_str(name).map(Some).map_err(|_| {
+        format!("unknown dialect '{name}' in the sqruff config; {}", valid_dialects())
     })
+}
+
+/// A `--dialect` name, in any case.
+fn parse_dialect(name: &str) -> Result<DialectKind, String> {
+    DialectKind::from_str(&name.to_ascii_lowercase())
+        .map_err(|_| format!("unknown dialect '{name}'; {}", valid_dialects()))
+}
+
+fn valid_dialects() -> String {
+    format!("valid dialects: {}", dialect_readout().join(", "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_dialect_flag_accepts_every_sqruff_dialect_in_any_case() {
+        assert_eq!(parse_dialect("mariadb"), Ok(DialectKind::Mariadb));
+        assert_eq!(parse_dialect("MariaDB"), Ok(DialectKind::Mariadb));
+        for name in dialect_readout() {
+            assert!(parse_dialect(&name.to_uppercase()).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_dialect_flag_is_an_error_naming_it() {
+        let err = parse_dialect("NoSuchSql").unwrap_err();
+        assert!(err.contains("NoSuchSql"), "{err}");
+    }
+
+    const BAD_CONFIGS: &[(&str, &str)] = &[
+        ("[sqruff]\ndialect = postgres\nmax_line_length = abc\n", "invalid sqruff config"),
+        (
+            "[sqruff]\ndialect = postgres\n\n[sqruff:layout:type:comma]\nline_position = bogus\n",
+            "invalid sqruff config",
+        ),
+        ("[sqruff]\ndialect = postgres\nrules = NOPE01\n", "NOPE01"),
+        ("[sqruff]\ndialect = nope\n", "nope"),
+        ("[sqruff]\ndialect = postgres\nmax_parse_depth = abc\n", "max_parse_depth"),
+        ("[sqruff]\ndialect = postgres\ntemplater = nope\n", "nope"),
+    ];
+
+    #[test]
+    fn an_invalid_config_is_an_error_not_a_panic() {
+        for (config, problem) in BAD_CONFIGS {
+            let result = std::panic::catch_unwind(|| SqruffEngine::from_source(config).err());
+            let err = result
+                .unwrap_or_else(|_| panic!("panicked on {config:?}"))
+                .unwrap_or_else(|| panic!("accepted {config:?}"));
+            assert!(err.contains(problem), "{config:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn valid_configs_build() {
+        for config in [
+            "[sqruff]\ndialect = postgres\n",
+            "[sqruff]\ndialect = postgres\nrules = LT01,LT02,CV05,CP01\n",
+            "[sqruff]\ndialect = postgres\nrules = LT09,CV05\n",
+            "[sqruff]\ndialect = mysql\nmax_line_length = 100\n",
+            "[sqruff]\ndialect = postgres\n\n[sqruff:layout:type:comma]\nline_position = leading\n",
+        ] {
+            let engine = SqruffEngine::from_source(config);
+            assert!(engine.is_ok(), "{config:?}: {:?}", engine.err());
+        }
+    }
 }
