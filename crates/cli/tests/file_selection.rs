@@ -89,6 +89,16 @@ fn stderr_lines(out: &Output, prefix: &str, parts: &[&str]) -> Vec<String> {
         .collect()
 }
 
+/// The canonical path of the file that a `<prefix> <path>: <message>` line
+/// names. Paths are compared canonically because the same file can be spelled
+/// differently, such as with the `\\?\` prefix that `canonicalize` adds on
+/// Windows.
+fn named_file(line: &str, prefix: &str, cwd: &Path) -> PathBuf {
+    let rest = line.strip_prefix(prefix).unwrap_or_else(|| panic!("{line}")).trim_start();
+    let (path, _message) = rest.split_once(": ").unwrap_or_else(|| panic!("{line}"));
+    cwd.join(path).canonicalize().unwrap()
+}
+
 #[test]
 fn a_path_that_does_not_exist_is_an_error_naming_it_before_any_work() {
     let p = Project::new("missing_path", &[("a.rs", QUERY)]);
@@ -157,9 +167,10 @@ fn an_unknown_key_in_the_section_is_reported_with_the_config_path() {
     let p = Project::new("unknown_key", &[(".sqruff", "[sqlx-sqruff]\nexclud = skip/**\n"), ("a.rs", QUERY)]);
     let out = p.run("", &["list"]);
     assert_eq!(out.status.code(), Some(0), "{}", report(&out));
-    let config = p.path(".sqruff").display().to_string();
-    let warnings = stderr_lines(&out, "warning:", &[&config, "'exclud'", "[sqlx-sqruff]"]);
+    let warnings = stderr_lines(&out, "warning:", &["'exclud'", "[sqlx-sqruff]"]);
     assert_eq!(warnings.len(), 1, "{}", report(&out));
+    let config = p.path(".sqruff").canonicalize().unwrap();
+    assert_eq!(named_file(&warnings[0], "warning:", &p.0), config, "{}", report(&out));
 }
 
 #[test]
@@ -168,12 +179,13 @@ fn an_invalid_boolean_is_an_error_naming_the_key_the_value_and_the_file() {
         "bad_bool",
         &[(".sqruff", "[sqlx-sqruff]\nrespect_gitignore = maybe\n"), ("a.rs", QUERY)],
     );
-    let config = p.path(".sqruff").display().to_string();
+    let config = p.path(".sqruff").canonicalize().unwrap();
     for command in ["list", "check"] {
         let out = p.run("", &[command]);
         assert_eq!(out.status.code(), Some(2), "{command}: {}", report(&out));
-        let errors = stderr_lines(&out, "error:", &[&config, "respect_gitignore", "maybe"]);
+        let errors = stderr_lines(&out, "error:", &["respect_gitignore", "maybe"]);
         assert_eq!(errors.len(), 1, "{command}: {}", report(&out));
+        assert_eq!(named_file(&errors[0], "error:", &p.0), config, "{command}: {}", report(&out));
     }
 }
 
