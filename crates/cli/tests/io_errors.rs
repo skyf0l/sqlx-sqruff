@@ -27,6 +27,7 @@ impl Project {
         Self(dir)
     }
 
+    #[cfg(unix)]
     fn path(&self, rel: &str) -> PathBuf {
         self.0.join(rel)
     }
@@ -41,6 +42,7 @@ impl Project {
             .unwrap()
     }
 
+    #[cfg(unix)]
     fn read(&self, rel: &str) -> Vec<u8> {
         fs::read(self.path(rel)).unwrap()
     }
