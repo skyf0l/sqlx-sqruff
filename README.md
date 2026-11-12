@@ -480,23 +480,23 @@ at your option.
 
 ## Releasing
 
-The CLI (`sqlx-sqruff`) and the library (`sqlx-sqruff-core`) have separate
-versions: the CLI follows `version` in the root `Cargo.toml`, the library sets
-its own in `crates/core/Cargo.toml` and stays `0.x`. Every release publishes
-both, so both versions must be new.
+The CLI (`sqlx-sqruff`) and the library (`sqlx-sqruff-core`) share one version:
+`version` under `[workspace.package]` in the root `Cargo.toml`. From 1.0 on, the
+library follows semantic versioning for its public API. Every release publishes
+both crates, so the version must be new for both.
 
-1. Set the CLI `version` in the root `Cargo.toml`, the library `version` in
-   `crates/core/Cargo.toml`, and the same library version on the
-   `sqlx-sqruff-core` dependency in the root `Cargo.toml`. Merge to `main`.
-2. Tag that commit `v<CLI version>` (for example `v1.0.0`) and push the tag.
+1. Set `version` under `[workspace.package]` in the root `Cargo.toml`, and the
+   same version on the `sqlx-sqruff-core` dependency under
+   `[workspace.dependencies]` in that file. Merge to `main`.
+2. Tag that commit `v<version>` (for example `v1.0.0`) and push the tag.
 
 The `Release` workflow then runs the full CI and checks, before publishing
 anything, that:
 
 - the tagged commit is on `main`,
-- the tag matches the CLI version,
-- neither crate's version is on crates.io yet, so a forgotten library version
-  bump fails here instead of halfway through the publish.
+- the tag matches the version,
+- neither crate's version is on crates.io yet, so a release that reuses a
+  published version fails here instead of halfway through the publish.
 
 It then publishes both crates to crates.io (library first) through trusted
 publishing, creates the GitHub release and attaches the binaries.

@@ -125,11 +125,14 @@ Before changing any of these, run the tool on a copy of a real sqlx codebase
 
 ## Versions and releases
 
-- The CLI follows `version` in the root `Cargo.toml`. The library has its own
-  `version` in `crates/core/Cargo.toml` and stays `0.x`; it promises no API
-  stability. The `sqlx-sqruff-core` dependency in the root `Cargo.toml` must name
-  the library's version.
-- Every release publishes both crates, so both versions must be new. The steps
+- The CLI and the library share one version: `version` under
+  `[workspace.package]` in the root `Cargo.toml`, which both crates inherit.
+  Bumping it means also bumping the `version` of the `sqlx-sqruff-core`
+  dependency under `[workspace.dependencies]` in the same file.
+- From 1.0 on, the library follows semantic versioning for its public API: a
+  breaking change to a public item of `sqlx-sqruff-core` needs a new major
+  version.
+- Every release publishes both crates, so the version must be new for both. The steps
   are in the README's Releasing section; the `Release` workflow checks the tag,
   the branch and both versions before publishing.
 - `rust-version` (MSRV) is 1.95, because sqruff uses an API stabilised in that
