@@ -197,7 +197,7 @@ fn every_command_prints_a_file_the_same_whichever_way_its_directory_is_named() {
         }
         let not_utf8 = format!("error: {}: ", os_path("src/not_utf8.rs"));
         assert!(stderr.lines().any(|l| l.starts_with(&not_utf8)), "{command:?}: {}", report(out));
-        let bad = format!("error: {}: ", os_path("src/bad.rs"));
+        let bad = format!("error: {}:", os_path("src/bad.rs"));
         assert!(stderr.lines().any(|l| l.starts_with(&bad)), "{command:?}: {}", report(out));
         for spelling in ["./", ".\\", absolute.as_str()] {
             assert!(!stdout.contains(spelling) && !stderr.contains(spelling), "{command:?} {spelling}: {}", report(out));

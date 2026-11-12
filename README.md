@@ -85,18 +85,24 @@ Exit codes:
 - Every command exits `2` on errors:
   - a path given on the command line that does not exist. This is checked
     before any work, and each missing path is named.
-  - no file to scan: the paths you name, or the current directory, hold no
-    `.rs` file that the [file selection](#selecting-which-files-to-scan)
-    keeps, for example an empty directory or an `include` that matches
-    nothing. The error names the paths searched, so a CI step cannot pass
-    while checking nothing.
+  - a path that selects no file to scan, so that a CI step cannot pass while
+    checking nothing. Every directory you name must hold at least one `.rs`
+    file that the [file selection](#selecting-which-files-to-scan) keeps; one
+    that does not (for example an empty directory, or one whose files
+    `exclude` or `.gitignore` prune) is named on an
+    `error: <path>: no Rust files found` line. With no path named, the same
+    applies to the current directory; when an `include` matches nothing, the
+    error names the config file and the directory its patterns are relative
+    to.
   - a file or directory that cannot be read (for example a file that is not
     UTF-8), a file that is not valid Rust (see *Unparsable Rust is an error for
     the whole file* under [Known limitations](#known-limitations)), or a fixed
     file that cannot be
-    written. Each such path is named on an `error: <path>: ...` line, the run
-    goes on with the other files and still prints its summary, and the exit
-    code is `2` at the end.
+    written. Each such path is named on an `error: <path>: ...` line
+    (`error: <path>:<line>:<col>: ...` for a file that is not valid Rust).
+
+  For these errors, the run goes on with the other paths and files and still
+  prints its summary, and the exit code is `2` at the end.
   - an invalid config, such as an unknown dialect, a `--config` file that
     cannot be read, or an invalid value in the `[sqlx-sqruff]` section.
   - an invalid argument, such as an unknown flag.
@@ -137,6 +143,37 @@ half-written file. The file keeps its permissions, a file named through a
 symbolic link is written through the link, and a read-only file is reported as
 an error instead of being replaced.
 
+### Fixes that can change a query
+
+With sqruff 0.44.0, the fixes of these rules can change what a query does, or
+make the database reject it:
+
+| Rule | What its fix can do |
+| ---- | ------------------- |
+| `AM02` | Rewrites `UNION` as `UNION DISTINCT`, which SQLite, T-SQL and Oracle reject. sqruff runs `AM02` with every dialect except `duckdb`, `exasol`, `postgres` and `sparksql`. ([sqruff#5291](https://github.com/quarylabs/sqruff/issues/5291)) |
+| `CP02` | Changes the case of unquoted identifiers, including table names, which MySQL and MariaDB treat as case-sensitive by default on most Unix systems. |
+| `RF03` | Qualifies a reference to the alias of an outer `unnest(...)` or `generate_series(...)` with the subquery's table (`w.id = k` becomes `w.id = w.k`, [sqruff#5288](https://github.com/quarylabs/sqruff/issues/5288)), and qualifies an `ORDER BY` reference to a quoted select alias (`ORDER BY "name"` becomes `ORDER BY t."name"`, [sqruff#5289](https://github.com/quarylabs/sqruff/issues/5289)). |
+| `ST06` | Reorders select lists whose order is used by position: the column list of a CTE, a derived table or a `LATERAL` subquery, `CREATE TABLE ... AS SELECT` on postgres, and row-value comparisons such as `(a, b) IN (SELECT ...)`. ([sqruff#5290](https://github.com/quarylabs/sqruff/issues/5290)) |
+| `ST07` | Rewrites only the first of chained `USING` joins (`... USING (k) ... USING (k)`), which PostgreSQL then rejects, and changes the columns that `SELECT *` returns. ([SQLFluff#8950](https://github.com/sqlfluff/sqlfluff/issues/8950)) |
+
+When `fix` or `fix --check` runs with any of these rules enabled, it prints one
+`warning:` line on stderr naming them. `AM02` counts only with a dialect that
+sqruff runs it on, and `CP02` only with `mysql` or `mariadb`. `check` does not
+warn, because it changes nothing.
+
+Review the changes that `fix --check` shows, or that `fix` made, before you
+commit them. To keep such a rule for `check` but not for `fix`, run `fix` with
+an extra config that excludes it, for example
+`sqlx-sqruff fix --config fix.sqruff` with this `fix.sqruff`:
+
+```ini
+[sqruff]
+exclude_rules = ST06,ST07
+```
+
+`--config` overrides the same key of the discovered config, so also list the
+rules your project's config already excludes.
+
 ### Output
 
 `check` prints one line per finding: `path:line:col: CODE message`. With
@@ -153,7 +190,7 @@ a finding that is not a rule violation:
 | ---- | ------- |
 | `PARSE` | sqruff could not parse the SQL with the configured dialect. |
 | `LEX` | sqruff could not split the SQL into tokens, for example at an unclosed quote. sqruff then also reports `PARSE` at the same place. |
-| `NOQA` | a `-- noqa` comment that sqruff cannot read, or, when sqruff's `warn_unused_ignores` is set, one that silences nothing. |
+| `NOQA` | a `-- noqa` comment that sqruff reports as malformed: `noqa` followed by something other than `:` (such as `-- noqa?` or `-- noqa CV05`), or `-- noqa:` with nothing after the colon. A comment that names no rule sqruff knows, such as `-- noqa:disable` (without `=`) or `-- noqa: foo=CV05`, is accepted without a finding and silences nothing. When sqruff's `warn_unused_ignores = True` is set, every `noqa` comment that silences nothing is reported too, those included. |
 | `INTERNAL` | sqruff failed on the query, for example on an invalid inline `-- sqruff:` config line, or one of its rules failed. The message says why. |
 
 Every path the tool prints (in findings, `list`, `dump`, the output of `fix`,
@@ -186,8 +223,14 @@ In each of those directories sqruff reads `.sqlfluff`, `.sqruff`,
 `.sqruff.ini`, `pyproject.toml` and `sqruff.toml`, in that order. Discovery
 starts from the current directory, not from the files being checked. A
 `.sqruff` at your project root is **the recommended way**: your project owns
-and version-controls it. With no config at all, sqruff's built-in defaults
-apply.
+and version-controls it.
+
+sqruff reads only its own sections (`[sqruff]`, `[sqruff:...]`, their
+`sqlfluff` forms, and `[tool.sqruff]` or `[tool.sqlfluff]` in a TOML file).
+When no config file sets an option there and no `--config` is given, sqruff's
+built-in default rules apply, and `check` and `fix` print a `note:` line on
+stderr saying so. This includes a project whose only config file holds just a
+`[sqlx-sqruff]` section.
 
 The only value the tool injects is `dialect`, resolved in this order:
 
@@ -204,6 +247,8 @@ the config or the flag, is reported as an error.
 
 sqruff's inline `noqa` comments work inside the SQL: end a line with
 `-- noqa` to silence every rule on that line, or `-- noqa: CV05` for one rule.
+sqruff does not report a comment that names no rule it knows, such as a
+misspelt one; see the `NOQA` code under [Output](#output).
 
 Since the rules and `.sqruff` format are sqruff's, see its docs directly:
 
@@ -231,6 +276,8 @@ finds inside a search root, never the root itself:
   `sqlx-sqruff check .` skip `gen/`, but `sqlx-sqruff check gen` scans it, as
   does a run started inside `gen/`. A pattern that matches the files or
   directories inside it, such as `gen/**` or `*.gen.rs`, still prunes them.
+  A directory you name in which nothing is selected is an error (exit `2`);
+  the other paths are still scanned.
 - Files found by walking a directory are scanned only when they end in `.rs`.
 
 To persist a project's scope, add a **`[sqlx-sqruff]`** section to your
@@ -395,8 +442,10 @@ the rules `fix` must keep.
   as trailing whitespace, and `fix` empties it.
 - **Unparsable Rust is an error for the whole file.** If `syn` cannot parse a
   file, none of its queries are read. Every command reports the file on an
-  `error: <path>: cannot parse as Rust: ...` line, goes on with the other
-  files, and exits `2`. A file that does not contain the text `query` is not
+  `error: <path>:<line>:<col>: cannot parse as Rust: ...` line, at the position
+  of `syn`'s error (for a bracket that is never closed, that bracket; for an
+  error at the end of the file, just after its last token), goes on with the
+  other files, and exits `2`. A file that does not contain the text `query` is not
   parsed at all, because it cannot hold a query, so it is never reported, even
   when it is not valid Rust.
 

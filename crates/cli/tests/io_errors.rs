@@ -113,6 +113,33 @@ fn a_file_that_does_not_parse_as_rust_is_an_error_naming_it_and_the_run_continue
     }
 }
 
+#[test]
+fn a_file_that_does_not_parse_as_rust_is_named_with_the_line_and_column_of_the_error() {
+    // `syn` expects an expression at the `;` on line 2, column 13.
+    let unparsable = b"fn f() {\n    let x = ;\n    let _ = sqlx::query!(\"SELECT 1\");\n}\n";
+    let p = Project::new("parse_position", &[("b.rs", unparsable)]);
+    for command in [&["check"][..], &["fix", "--check"], &["fix"], &["list"], &["dump"]] {
+        let mut args = command.to_vec();
+        args.push("b.rs");
+        let out = p.run(&args);
+        assert_eq!(out.status.code(), Some(2), "{command:?}: {}", report(&out));
+        assert!(stderr_has(&out, "error: b.rs:2:13: ", "Rust"), "{command:?}: {}", report(&out));
+    }
+}
+
+#[test]
+fn check_and_fix_count_the_files_that_failed_in_the_same_words() {
+    let unparsable = b"fn f() {\n    let _ = sqlx::query!(\"SELECT a FROM t WHERE x = NULL\");\n";
+    let p = Project::new("summary", &[("a.rs", FIXABLE.as_bytes()), ("b.rs", unparsable)]);
+    for command in [&["check"][..], &["fix", "--check"], &["fix"]] {
+        let mut args = command.to_vec();
+        args.extend(["a.rs", "b.rs"]);
+        let out = p.run(&args);
+        assert_eq!(out.status.code(), Some(2), "{command:?}: {}", report(&out));
+        assert!(stderr_has(&out, "", "; 1 file(s) failed."), "{command:?}: {}", report(&out));
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn a_file_that_cannot_be_written_is_named_and_fix_continues() {

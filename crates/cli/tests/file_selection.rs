@@ -288,17 +288,54 @@ const COMMANDS: [&[&str]; 5] = [&["check"], &["fix", "--check"], &["fix"], &["li
 fn a_run_that_selects_no_rust_file_is_an_error_naming_the_searched_paths() {
     let config = "[sqruff]\ndialect = postgres\nrules = CV05\n\n[sqlx-sqruff]\ninclude = nomatch/**/*.rs\n";
     let p = Project::new("nothing_selected", &[(".sqruff", config), ("a.rs", CV05_QUERY), ("empty/notes.txt", QUERY)]);
+    // With no path named, the error names the config file whose `include`
+    // selected nothing.
     for command in COMMANDS {
-        for (paths, searched) in [(&["empty"][..], "empty"), (&[], ".")] {
+        for (paths, named) in [(&["empty"][..], "empty"), (&[], ".sqruff")] {
             let out = p.run("", &[command, paths].concat());
             assert_eq!(out.status.code(), Some(2), "{command:?} {paths:?}: {}", report(&out));
             let errors = stderr_lines(&out, "error:", &["no Rust files"]);
             assert_eq!(errors.len(), 1, "{command:?} {paths:?}: {}", report(&out));
-            assert!(errors[0].ends_with(&format!(" {searched}")), "{command:?} {paths:?}: {}", report(&out));
+            let named = p.path(named).canonicalize().unwrap();
+            assert_eq!(named_file(&errors[0], "error:", &p.0), named, "{command:?} {paths:?}: {}", report(&out));
             assert!(out.stdout.is_empty(), "{command:?} {paths:?}: {}", report(&out));
         }
     }
     assert_eq!(fs::read_to_string(p.path("a.rs")).unwrap(), CV05_QUERY);
+}
+
+#[test]
+fn an_include_that_matches_nothing_names_the_config_file_and_the_directory_of_its_patterns() {
+    let config = "[sqruff]\ndialect = postgres\nrules = CV05\n\n[sqlx-sqruff]\ninclude = nomatch/**/*.rs\n";
+    let p = Project::new("include_nothing", &[(".sqruff", config), ("sub/a.rs", QUERY)]);
+    let out = p.run("sub", &["list"]);
+    assert_eq!(out.status.code(), Some(2), "{}", report(&out));
+    let errors = stderr_lines(&out, "error:", &["[sqlx-sqruff] include"]);
+    assert_eq!(errors.len(), 1, "{}", report(&out));
+    let config = p.path(".sqruff").canonicalize().unwrap();
+    assert_eq!(named_file(&errors[0], "error:", &p.path("sub")), config, "{}", report(&out));
+    let (_, dir) = errors[0].rsplit_once("relative to ").unwrap_or_else(|| panic!("{}", report(&out)));
+    assert_eq!(p.path("sub").join(dir).canonicalize().unwrap(), p.0, "{}", report(&out));
+}
+
+#[test]
+fn a_named_path_that_selects_no_rust_file_is_an_error_and_the_other_paths_are_still_scanned() {
+    let config = "[sqruff]\ndialect = postgres\nrules = CV05\n\n[sqlx-sqruff]\nexclude = gen/**\n";
+    let p = Project::new(
+        "named_selects_nothing",
+        &[(".sqruff", config), ("src/a.rs", CV05_QUERY), ("empty/notes.txt", QUERY), ("gen/g.rs", QUERY)],
+    );
+    let scanned = Path::new("src").join("a.rs").display().to_string();
+    for command in COMMANDS {
+        let out = p.run("", &[command, &["empty", "src", "gen"]].concat());
+        assert_eq!(out.status.code(), Some(2), "{command:?}: {}", report(&out));
+        let errors = stderr_lines(&out, "error:", &["no Rust files"]);
+        assert_eq!(errors.len(), 2, "{command:?}: {}", report(&out));
+        let named: BTreeSet<PathBuf> = errors.iter().map(|line| named_file(line, "error:", &p.0)).collect();
+        assert_eq!(named, p.files(&["empty", "gen"]), "{command:?}: {}", report(&out));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains(&scanned), "{command:?}: {}", report(&out));
+    }
 }
 
 #[test]

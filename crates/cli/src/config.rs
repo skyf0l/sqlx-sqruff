@@ -35,14 +35,14 @@ pub struct CliSettings {
     pub exclude: Vec<String>,
     /// Honour `.gitignore` / `.ignore` / `.git/info/exclude` during the walk.
     pub respect_gitignore: bool,
-    /// The directory of the config file that set these, which the globs are
-    /// relative to. `None` when no file has a `[sqlx-sqruff]` section.
-    pub base: Option<PathBuf>,
+    /// The resolved path of the config file that set these. `None` when no file
+    /// has a `[sqlx-sqruff]` section.
+    pub file: Option<PathBuf>,
 }
 
 impl Default for CliSettings {
     fn default() -> Self {
-        Self { include: Vec::new(), exclude: Vec::new(), respect_gitignore: true, base: None }
+        Self { include: Vec::new(), exclude: Vec::new(), respect_gitignore: true, file: None }
     }
 }
 
@@ -79,6 +79,11 @@ impl CliSettings {
         }
     }
 
+    /// The directory of [`file`](Self::file), which the globs are relative to.
+    pub fn base(&self) -> Option<&Path> {
+        self.file.as_deref().and_then(Path::parent)
+    }
+
     /// The section of the config file at `path`, or `None` when it has none.
     fn load_file(path: &Path) -> Result<Option<Self>> {
         let shown = shown(path);
@@ -93,7 +98,7 @@ impl CliSettings {
         let file = path
             .canonicalize()
             .with_context(|| format!("resolving config {}", shown.display()))?;
-        Ok(Some(Self { base: file.parent().map(Path::to_path_buf), ..section.settings }))
+        Ok(Some(Self { file: Some(file), ..section.settings }))
     }
 }
 
