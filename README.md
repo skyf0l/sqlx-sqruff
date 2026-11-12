@@ -90,16 +90,20 @@ Exit codes:
     file that the [file selection](#selecting-which-files-to-scan) keeps; one
     that does not (for example an empty directory, or one whose files
     `exclude` or `.gitignore` prune) is named on an
-    `error: <path>: no Rust files found` line. With no path named, the same
+    `error: <path>: no Rust files found` line, or, when the directory cannot be
+    read, on a line that gives the reading error instead. With no path named, the same
     applies to the current directory; when an `include` matches nothing, the
     error names the config file and the directory its patterns are relative
     to.
   - a file or directory that cannot be read (for example a file that is not
-    UTF-8), a file that is not valid Rust (see *Unparsable Rust is an error for
-    the whole file* under [Known limitations](#known-limitations)), or a fixed
-    file that cannot be
-    written. Each such path is named on an `error: <path>: ...` line
-    (`error: <path>:<line>:<col>: ...` for a file that is not valid Rust).
+    UTF-8), a file that is not valid Rust, or a fixed file that cannot be
+    written. A file you name on the command line is always parsed as Rust; a
+    file found by walking a directory is parsed only when it contains the text
+    `query`, so one without it is never reported as invalid Rust (see
+    *Unparsable Rust is an error for the whole file* under
+    [Known limitations](#known-limitations)). Each such path is named on one
+    `error: <path>: ...` line (`error: <path>:<line>:<col>: ...` for a file
+    that is not valid Rust).
 
   For these errors, the run goes on with the other paths and files and still
   prints its summary, and the exit code is `2` at the end.
@@ -130,7 +134,10 @@ keep it on one line.
   [Known limitations](#known-limitations).
 
 After rewriting a query, and before writing the file, `fix` lints and fixes the
-rewritten query again. When sqruff still reports a finding there, because part
+rewritten query again. When sqruff cannot fully parse the rewritten SQL, or one
+of its rules fails on it, the rewrite is not written: `fix` warns that the
+fixed SQL no longer parses and counts the query as not applied. When sqruff
+still reports a finding there, because part
 of its fix needs a different line layout (for example the line breaks that
 `LT05` or `LT09` add to a one-line query), `fix` writes the part that fits,
 warns that the rest was not applied, and counts the query as not applied. The
@@ -387,7 +394,10 @@ the rules `fix` must keep.
   statement to the end of its block; a function or closure parameter, for the
   whole body; a binding in a `match` arm, `if let`, `while let` or `for`
   pattern, for that arm or body. A variable in an inner block does not hide
-  the import outside that block, and `sqlx::query("...")` written with its
+  the import outside that block. As in Rust, an item declared inside a block
+  (a `fn`, `impl`, `trait`, `const` or `static`) does not see the variables of
+  the blocks around it, so they do not hide the import inside that item, while
+  a closure does see them. `sqlx::query("...")` written with its
   path is still extracted. Variables do not hide macros, so `query!(...)` still
   counts.
 - **A crate alias counts as sqlx.** After `use sqlx as db;` (in the same module
@@ -445,9 +455,11 @@ the rules `fix` must keep.
   `error: <path>:<line>:<col>: cannot parse as Rust: ...` line, at the position
   of `syn`'s error (for a bracket that is never closed, that bracket; for an
   error at the end of the file, just after its last token), goes on with the
-  other files, and exits `2`. A file that does not contain the text `query` is not
-  parsed at all, because it cannot hold a query, so it is never reported, even
-  when it is not valid Rust.
+  other files, and exits `2`. This holds for every file you name on the command
+  line, and for every file found by walking a directory that contains the text
+  `query`. A file found by walking a directory that does not contain the text
+  `query` is not parsed at all, because it cannot hold a query, so it is never
+  reported, even when it is not valid Rust.
 
 Note: apart from the imports a bare name needs, a query's location doesn't
 matter. A `sqlx::query!` or `sqlx::query("...")` inside a function body,

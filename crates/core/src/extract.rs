@@ -49,7 +49,19 @@ const RECORD_TYPE_MACROS: &[&str] = &["query_as", "query_as_unchecked"];
 /// does not parse; use [`extract_checked`] to distinguish "no queries" from
 /// "file didn't parse" so callers can report it instead of silently skipping.
 pub fn extract(src: &str) -> Vec<QueryLiteral> {
+    if !may_hold_a_query(src) {
+        return Vec::new();
+    }
     extract_checked(src).unwrap_or_default()
+}
+
+/// Whether `src` can hold a query at all, checked without parsing it: every
+/// query function and macro name contains `query`. Parsing is the slow part of
+/// extraction, and most files of a codebase hold no query, so a caller can skip
+/// [`extract_checked`] for a file where this is `false`, at the cost of not
+/// learning whether that file is valid Rust.
+pub fn may_hold_a_query(src: &str) -> bool {
+    src.contains("query")
 }
 
 /// Why a file is not valid Rust.
@@ -64,18 +76,10 @@ pub struct ParseError {
 }
 
 /// Like [`extract`], but returns the `syn` parse error so callers can report
-/// that a whole file was skipped (rather than hiding its queries).
+/// that a whole file was skipped (rather than hiding its queries). Always
+/// parses `src`, so a file that is not valid Rust is an error even when it
+/// holds no query.
 pub fn extract_checked(src: &str) -> Result<Vec<QueryLiteral>, ParseError> {
-    // Cheap byte-substring gate before the expensive `syn::parse_file`: every
-    // supported macro and function name (`query`, `query_as`, ...) contains
-    // "query", so a file without that substring has no inline SQL and need not
-    // be parsed at all. In a typical codebase most `.rs` files hold no query, so
-    // this skips the bulk of the parsing work. A file that fails to parse but
-    // contains no "query" is reported as having no queries (Ok-empty), never as
-    // skipped, which is the correct outcome.
-    if !src.contains("query") {
-        return Ok(Vec::new());
-    }
     let file = syn::parse_file(src).map_err(|e| {
         // An error at the end of the file has no token to point at, so its span
         // covers no source text and starts at line 1. Point after the last token.
@@ -138,6 +142,10 @@ impl<'ast> Visit<'ast> for Visitor {
         self.scopes.push(Scope::new(true, &file.items));
         syn::visit::visit_file(self, file);
         self.scopes.pop();
+    }
+
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        self.with_scope(Scope { item: true, ..Scope::default() }, |v| syn::visit::visit_item(v, item));
     }
 
     fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
@@ -384,7 +392,13 @@ impl Visitor {
     }
 
     fn resolve(&self, name: &str, namespace: Namespace) -> Option<&'static str> {
-        match self.enclosing_scopes().find_map(|scope| scope.lookup(name, namespace)) {
+        let mut locals_visible = true;
+        let meaning = self.enclosing_scopes().find_map(|scope| {
+            let meaning = scope.lookup(name, namespace, locals_visible);
+            locals_visible &= !scope.item;
+            meaning
+        });
+        match meaning {
             Some(Meaning::Sqlx(name)) => Some(name),
             Some(Meaning::Other) => None,
             None if matches!(namespace, Namespace::Macro) && self.macro_use => namespace.query_name(name),
@@ -430,6 +444,10 @@ enum Meaning {
 struct Scope {
     /// Whether this is a module, which does not see the names around it.
     module: bool,
+    /// Whether this is the scope of an item (a `fn`, `impl`, `const`, ...),
+    /// which sees the items and imports of the blocks around it but not their
+    /// variables.
+    item: bool,
     /// Local names of sqlx query functions imported by a `use` item, with the
     /// sqlx name of each.
     functions: HashMap<String, &'static str>,
@@ -493,9 +511,10 @@ impl Scope {
     }
 
     /// What `name` means here, or `None` when this scope says nothing about it.
-    fn lookup(&self, name: &str, namespace: Namespace) -> Option<Meaning> {
+    /// `locals` is whether the variables of this scope are visible.
+    fn lookup(&self, name: &str, namespace: Namespace, locals: bool) -> Option<Meaning> {
         let (imported, other) = match namespace {
-            Namespace::Function if self.locals.contains(name) => return Some(Meaning::Other),
+            Namespace::Function if locals && self.locals.contains(name) => return Some(Meaning::Other),
             Namespace::Function => (&self.functions, &self.other_functions),
             Namespace::Macro => (&self.macros, &self.other_macros),
         };
@@ -990,6 +1009,44 @@ fn after() { let _ = query("SELECT 16"); }
     }
 
     #[test]
+    fn an_item_in_a_block_sees_the_imports_of_the_blocks_around_it_but_not_their_variables() {
+        let src = r###"
+use sqlx::query;
+fn outer(query: u8) {
+    fn inner() { let _ = query("SELECT 1"); }
+    let _ = || query("not sql 2");
+}
+fn g() {
+    let query = 1;
+    fn k() { query("SELECT 3"); }
+    impl T { fn m(&self) { query("SELECT 4"); } }
+    trait U { fn d() { query("SELECT 5"); } }
+    const C: Q = { query("SELECT 6") };
+    static S: Q = query("SELECT 7");
+    let _ = |x: u8| query("not sql 8");
+}
+fn h() {
+    use sqlx::query_as;
+    let query_as = 2;
+    fn inner(query: u8) { let _ = query_as("SELECT 9"); query("not sql 10"); }
+    query_as("not sql 11");
+}
+"###;
+        assert_eq!(
+            texts(src),
+            [
+                "\"SELECT 1\"",
+                "\"SELECT 3\"",
+                "\"SELECT 4\"",
+                "\"SELECT 5\"",
+                "\"SELECT 6\"",
+                "\"SELECT 7\"",
+                "\"SELECT 9\"",
+            ]
+        );
+    }
+
+    #[test]
     fn finds_queries_in_macros_whose_arguments_are_not_expressions() {
         let src = r###"
 use sqlx::query;
@@ -1250,10 +1307,18 @@ fn f() {
 
     #[test]
     fn pre_filter_skips_query_free_files_without_parsing() {
-        // No "query" substring -> Ok-empty without invoking syn, even if the file
-        // would not parse. Such files are never reported as skipped/unparsable.
-        assert!(extract_checked("this is not rust {{{").unwrap().is_empty());
+        // No "query" substring: `extract` returns empty without invoking syn,
+        // even if the file would not parse.
+        assert!(!may_hold_a_query("this is not rust {{{"));
+        assert!(!may_hold_a_query("fn f() { let x = 1; }"));
+        assert!(may_hold_a_query("fn f() { sqlx::query_as(\"SELECT 1\"); }"));
+        assert!(extract("this is not rust {{{").is_empty());
         assert!(extract_checked("fn f() { let x = 1; }").unwrap().is_empty());
+    }
+
+    #[test]
+    fn extract_checked_reports_a_file_that_is_not_rust_even_without_a_query() {
+        assert!(extract_checked("fn f( {{{ not rust").is_err());
     }
 
     #[test]
