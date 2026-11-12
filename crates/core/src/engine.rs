@@ -99,19 +99,28 @@ pub struct FixOutcome {
     /// 1-based `.rs` line and first line of sqruff's error message for each
     /// literal sqruff could not process; those literals were left untouched.
     pub sqruff_errors: Vec<(usize, String)>,
-    /// 1-based `.rs` line and fixable rule codes of literals that sqruff
-    /// changed but that could not be rewritten in their current line layout
-    /// (for example a one-liner whose fix needs line breaks); those fixes were
-    /// not applied.
+    /// 1-based `.rs` line of literals that sqruff changed but that could not be
+    /// rewritten in their current line layout (for example a one-liner whose
+    /// fix needs line breaks); those fixes were not applied.
+    ///
+    /// In this field, `partly_applied`, `unstable` and `unsettled`, each line
+    /// comes with the fixable rule codes that `check` reports on the literal as
+    /// it stays in the file: the rules whose fix was not applied.
     pub layout_kept: Vec<(usize, Vec<String>)>,
-    /// 1-based `.rs` line, and the fixable rule codes sqruff still reports, of
-    /// rewritten literals that only took the part of sqruff's change that fits
-    /// their line layout; the rest was not applied.
+    /// 1-based `.rs` line of rewritten literals that only took the part of
+    /// sqruff's change that fits their line layout; the rest was not applied.
     pub partly_applied: Vec<(usize, Vec<String>)>,
-    /// 1-based `.rs` line, and the fixable rule codes sqruff still reports, of
-    /// literals left untouched because fixing the rewritten literal again
-    /// would change it further, so `fix` would never converge on it.
+    /// 1-based `.rs` line of literals left untouched because fixing the
+    /// rewritten literal again would change it further, so `fix` would never
+    /// converge on it. Their SQL starts right after the opening quote and
+    /// continues on more lines, so a layout fix that indents every following
+    /// line only grows the indent those lines share.
     pub unstable: Vec<(usize, Vec<String>)>,
+    /// 1-based `.rs` line of literals left untouched because fixing the
+    /// rewritten literal again would change it further, although their SQL is
+    /// on one line or starts on its own line: sqruff's own fixes do not settle
+    /// on the query.
+    pub unsettled: Vec<(usize, Vec<String>)>,
     /// 1-based `.rs` lines of literals whose SQL did not fully parse with the
     /// configured dialect, or on which a sqruff rule failed; sqruff's fixes for
     /// them were not applied, because a fix built on a wrong parse can change
@@ -128,8 +137,21 @@ impl FixOutcome {
             + self.layout_kept.len()
             + self.partly_applied.len()
             + self.unstable.len()
+            + self.unsettled.len()
             + self.unparsable_lines.len()
     }
+}
+
+/// The fixes of a file that were all discarded, because the file would no
+/// longer parse as Rust with the rewritten literals spliced in.
+#[derive(Debug)]
+pub struct Discarded {
+    /// What happened, naming the file.
+    pub message: String,
+    /// The number of queries in the file whose fix was not applied: those
+    /// whose rewrite was discarded, and those counted by
+    /// [`FixOutcome::not_applied`].
+    pub not_applied: usize,
 }
 
 /// Fix every inline query and splice back, preserving each literal's line-shape
@@ -140,7 +162,7 @@ impl FixOutcome {
 /// Convenience wrapper that extracts then fixes (used by tests). The CLI calls
 /// [`extract_checked`](crate::extract::extract_checked) once and then
 /// [`fix_extracted`] directly, to avoid parsing each file twice.
-pub fn fix_file(path: &str, src: &str, engine: &SqruffEngine) -> Result<FixOutcome, String> {
+pub fn fix_file(path: &str, src: &str, engine: &SqruffEngine) -> Result<FixOutcome, Discarded> {
     fix_extracted(path, src, &extract(src), engine)
 }
 
@@ -150,7 +172,7 @@ pub fn fix_extracted(
     src: &str,
     queries: &[QueryLiteral],
     engine: &SqruffEngine,
-) -> Result<FixOutcome, String> {
+) -> Result<FixOutcome, Discarded> {
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
     let mut changes = Vec::new();
     let mut skipped_escapes = 0;
@@ -159,6 +181,7 @@ pub fn fix_extracted(
     let mut layout_kept = Vec::new();
     let mut partly_applied = Vec::new();
     let mut unstable = Vec::new();
+    let mut unsettled = Vec::new();
     let mut unparsable_lines = Vec::new();
     for q in queries {
         let Some(lit) = ParsedLiteral::parse(&q.text) else {
@@ -186,23 +209,30 @@ pub fn fix_extracted(
             skipped_escapes += 1;
             continue;
         }
-        let Some((new_literal, content)) = rebuild_literal(&lit, &view.indent, &fixed) else {
-            layout_kept.push((q.line, fixable_codes(&findings)));
+        let rebuilt = rebuild_literal(&lit, &view.indent, &fixed);
+        let Some((new_literal, content)) = rebuilt.filter(|(new_literal, _)| *new_literal != q.text)
+        else {
+            push_checked_codes(&mut layout_kept, &mut sqruff_errors, q.line, &q.text, engine);
             continue;
         };
-        if new_literal == q.text {
-            layout_kept.push((q.line, fixable_codes(&findings)));
-            continue;
-        }
         if !has_value(&new_literal, &content) {
             dropped_lines.push(q.line);
             continue;
         }
         match recheck(&new_literal, engine) {
             Ok(Recheck::Clean) => {}
-            Ok(Recheck::Residual(codes)) => partly_applied.push((q.line, codes)),
-            Ok(Recheck::Unstable(codes)) => {
-                unstable.push((q.line, codes));
+            Ok(Recheck::Residual) => {
+                if !push_checked_codes(&mut partly_applied, &mut sqruff_errors, q.line, &new_literal, engine) {
+                    continue;
+                }
+            }
+            Ok(Recheck::Unstable) => {
+                // Only a first SQL line stuck to the opening quote, with more
+                // SQL lines after it, lets a layout fix grow the indent they
+                // share; the framing after the last SQL line has no indent.
+                let stuck = !lit.content.starts_with('\n') && view.sql.trim_end().contains('\n');
+                let entries = if stuck { &mut unstable } else { &mut unsettled };
+                push_checked_codes(entries, &mut sqruff_errors, q.line, &q.text, engine);
                 continue;
             }
             Ok(Recheck::Unparsable(codes)) => {
@@ -224,18 +254,20 @@ pub fn fix_extracted(
         edits.push((q.start_byte, q.end_byte, new_literal));
     }
 
+    let mut outcome = FixOutcome {
+        new_src: None,
+        changes,
+        skipped_escapes,
+        dropped_lines,
+        sqruff_errors,
+        layout_kept,
+        partly_applied,
+        unstable,
+        unsettled,
+        unparsable_lines,
+    };
     if edits.is_empty() {
-        return Ok(FixOutcome {
-            new_src: None,
-            changes,
-            skipped_escapes,
-            dropped_lines,
-            sqruff_errors,
-            layout_kept,
-            partly_applied,
-            unstable,
-            unparsable_lines,
-        });
+        return Ok(outcome);
     }
 
     // Splice right-to-left so byte offsets stay valid.
@@ -247,31 +279,24 @@ pub fn fix_extracted(
 
     // Safety invariant: never emit a file that no longer parses.
     if syn::parse_file(&new_src).is_err() {
-        return Err(format!("fix produced unparsable Rust in {path}; discarded"));
+        return Err(Discarded {
+            message: format!("fix produced unparsable Rust in {path}; discarded"),
+            not_applied: edits.len() + outcome.not_applied(),
+        });
     }
 
-    Ok(FixOutcome {
-        new_src: Some(new_src),
-        changes,
-        skipped_escapes,
-        dropped_lines,
-        sqruff_errors,
-        layout_kept,
-        partly_applied,
-        unstable,
-        unparsable_lines,
-    })
+    outcome.new_src = Some(new_src);
+    Ok(outcome)
 }
 
 /// What sqruff still wants to change in a rewritten literal.
 enum Recheck {
     Clean,
-    /// sqruff still reports these rules, but its fix rebuilds into the same
+    /// sqruff still changes the SQL, but its fix rebuilds into the same
     /// literal: the rest of its change needs a different line layout.
-    Residual(Vec<String>),
-    /// Fixing the literal again would rewrite it once more; sqruff reports
-    /// these rules.
-    Unstable(Vec<String>),
+    Residual,
+    /// Fixing the literal again would rewrite it once more.
+    Unstable,
     /// sqruff cannot fully parse the literal's SQL, or one of its rules failed
     /// on it, with these codes: the fix broke the SQL, so it must not be
     /// written.
@@ -283,7 +308,7 @@ enum Recheck {
 /// be read back counts as unstable.
 fn recheck(literal: &str, engine: &SqruffEngine) -> Result<Recheck, String> {
     let Some(lit) = ParsedLiteral::parse(literal) else {
-        return Ok(Recheck::Unstable(Vec::new()));
+        return Ok(Recheck::Unstable);
     };
     let view = LintView::new(&lit.content);
     let (fixed, findings) = engine.fix(&view.sql)?;
@@ -309,10 +334,36 @@ fn recheck_outcome(
     if fixed == view.sql {
         return Recheck::Clean;
     }
-    let codes = fixable_codes(findings);
     match rebuild_literal(lit, &view.indent, fixed) {
-        Some((again, _)) if again != literal => Recheck::Unstable(codes),
-        _ => Recheck::Residual(codes),
+        Some((again, _)) if again != literal => Recheck::Unstable,
+        _ => Recheck::Residual,
+    }
+}
+
+/// Push `line` to `entries` with the fixable rule codes that `check` reports
+/// on `literal`, the text that stays in the file. When sqruff cannot lint it,
+/// push the error to `sqruff_errors` instead and return `false`.
+fn push_checked_codes(
+    entries: &mut Vec<(usize, Vec<String>)>,
+    sqruff_errors: &mut Vec<(usize, String)>,
+    line: usize,
+    literal: &str,
+    engine: &SqruffEngine,
+) -> bool {
+    // A fix run reports some findings on SQL that earlier rules already fixed,
+    // so its codes can differ from those of the lint that `check` runs.
+    let findings = ParsedLiteral::parse(literal)
+        .ok_or_else(|| "the literal cannot be read back".to_string())
+        .and_then(|lit| engine.lint(&LintView::new(&lit.content).sql));
+    match findings {
+        Ok(findings) => {
+            entries.push((line, fixable_codes(&findings)));
+            true
+        }
+        Err(e) => {
+            sqruff_errors.push((line, first_line(&e).to_string()));
+            false
+        }
     }
 }
 
@@ -792,6 +843,7 @@ mod tests {
         all.extend(lines(&out.layout_kept));
         all.extend(lines(&out.partly_applied));
         all.extend(lines(&out.unstable));
+        all.extend(lines(&out.unsettled));
         all.extend(&out.unparsable_lines);
         all
     }
@@ -974,7 +1026,89 @@ mod tests {
         assert_eq!(out.new_src, None);
         assert_eq!(lines(&out.unstable), [2]);
         assert!(out.unstable[0].1.contains(&"LT02".to_string()), "{:?}", out.unstable);
+        assert!(out.unsettled.is_empty(), "{:?}", out.unsettled);
+        assert_eq!(out.unstable[0].1, checked_codes(src, &eng));
         assert_eq!(out.not_applied(), 1);
+    }
+
+    /// The distinct codes `check` reports on `src`, sorted, leaving out the
+    /// rules whose findings sqruff cannot fix.
+    fn checked_codes(src: &str, eng: &SqruffEngine) -> Vec<String> {
+        let fixable: Vec<String> = extract(src)
+            .iter()
+            .flat_map(|q| eng.lint(&LintView::new(&ParsedLiteral::parse(&q.text).unwrap().content).sql).unwrap())
+            .filter(|f| f.fixable)
+            .map(|f| f.code)
+            .collect();
+        let mut codes: Vec<String> =
+            check_file("f.rs", src, eng).into_iter().map(|d| d.code).filter(|c| fixable.contains(c)).collect();
+        codes.sort();
+        codes.dedup();
+        codes
+    }
+
+    /// Queries whose SQL is on one line or starts on its own line, on which
+    /// sqruff's own fixes do not settle: ST09 swaps the join condition back and
+    /// forth, and LT09 and LT05 undo each other. The second one's SQL is stuck
+    /// to the opening quote but has no continuation line whose indent could
+    /// grow.
+    const UNSETTLED: [(&str, &str); 4] = [
+        (
+            "[sqruff]\ndialect = postgres\nrules = ST09\n",
+            "fn f() {\n    let _ = sqlx::query!(\"SELECT id FROM (SELECT a.id FROM alpha AS a INNER JOIN beta AS b ON a.id = b.alpha_id UNION SELECT a.id FROM beta AS b INNER JOIN alpha AS a ON b.alpha_id = a.id) AS choices\");\n}\n",
+        ),
+        (
+            "[sqruff]\ndialect = postgres\nrules = ST09\n",
+            "fn f() {\n    let _ = sqlx::query!(\"SELECT id FROM (SELECT a.id FROM alpha AS a INNER JOIN beta AS b ON a.id = b.alpha_id UNION SELECT a.id FROM beta AS b INNER JOIN alpha AS a ON b.alpha_id = a.id) AS choices\n    \");\n}\n",
+        ),
+        (
+            "[sqruff]\ndialect = postgres\nrules = all\n",
+            "fn f() {\n    let _ = sqlx::query!(r#\"\n        SELECT id FROM (\n            SELECT a.id FROM alpha AS a INNER JOIN beta AS b ON a.id = b.alpha_id\n            UNION\n            SELECT a.id FROM beta AS b INNER JOIN alpha AS a ON b.alpha_id = a.id\n        ) AS choices\n    \"#);\n}\n",
+        ),
+        (
+            "[sqruff]\ndialect = postgres\nrules = all\nmax_line_length = 60\n",
+            "fn f() {\n    let _ = sqlx::query_as!(Row, r#\"\n        SELECT\n            compute_total(o.amount, o.discount) AS \"total!: Amount\"\n        FROM orders AS o\n        WHERE o.id = $1\n    \"#, id);\n}\n",
+        ),
+    ];
+
+    #[test]
+    fn a_query_sqruff_does_not_settle_on_is_left_untouched_with_the_rules_check_reports() {
+        for (config, src) in UNSETTLED {
+            let eng = SqruffEngine::from_source(config).unwrap();
+            let out = fix_file("f.rs", src, &eng).unwrap();
+            assert_eq!(out.new_src, None, "{src}");
+            assert!(out.unstable.is_empty(), "{src}");
+            assert_eq!(lines(&out.unsettled), [2], "{src}");
+            assert_eq!(out.not_applied(), 1, "{src}");
+            assert_eq!(out.unsettled[0].1, checked_codes(src, &eng), "{src}");
+        }
+    }
+
+    #[test]
+    fn a_partly_applied_fix_names_the_rules_check_reports_on_the_written_literal() {
+        // A fix run of this one-line SQL leaves out LT14, which a lint of the
+        // same SQL reports.
+        let eng = SqruffEngine::from_source("[sqruff]\ndialect = postgres\nrules = all\nmax_line_length = 40\n").unwrap();
+        let src = "fn f() {\n    let _ = sqlx::query(\"SELECT  a, b, c, d FROM some_table WHERE x IS NULL AND y = 2\");\n}\n";
+        let out = fix_file("f.rs", src, &eng).unwrap();
+        let fixed = out.new_src.expect("the double space is removed");
+        assert_eq!(lines(&out.partly_applied), [2]);
+        assert!(out.partly_applied[0].1.contains(&"LT14".to_string()), "{:?}", out.partly_applied);
+        assert_eq!(out.partly_applied[0].1, checked_codes(&fixed, &eng));
+    }
+
+    #[test]
+    fn a_file_discarded_because_it_would_not_parse_counts_every_query_not_applied() {
+        // Extraction never gives a wrong byte range, so one that also covers
+        // the `)` after the second literal is built here to break the splice.
+        // The third literal uses a `\t` escape, so it is not rewritten.
+        let src = "fn f() {\n    let _ = sqlx::query(\"SELECT a FROM t WHERE x = NULL\");\n    let _ = sqlx::query(\"SELECT b FROM t WHERE x = NULL\");\n    let _ = sqlx::query(\"SELECT c FROM t WHERE x = NULL AND y = '\\t'\");\n}\n";
+        let mut queries = extract(src);
+        assert_eq!(queries.len(), 3);
+        queries[1].end_byte += 1;
+        let discarded = fix_extracted("f.rs", src, &queries, &engine()).err().expect("the spliced file does not parse");
+        assert_eq!(discarded.not_applied, 3);
+        assert!(discarded.message.contains("f.rs"), "{}", discarded.message);
     }
 
     #[test]

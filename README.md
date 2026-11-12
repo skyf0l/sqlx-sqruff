@@ -59,8 +59,10 @@ sqlx-sqruff dump   [PATHS...]              # debug: print each query's SQL as th
 Shared flags on `check` / `fix`:
 
 - `--config FILE`: an extra sqruff config file, applied on top of the config
-  that sqruff discovers (it does not replace it; see
-  [Config resolution](#config-resolution)).
+  that sqruff discovers from the current directory (it does not replace it;
+  see [Config resolution](#config-resolution)). Its `[sqlx-sqruff]` section,
+  when it has one, also selects the files (see
+  [Selecting which files to scan](#selecting-which-files-to-scan)).
 - `--dialect NAME`: SQL dialect, overriding the config's `dialect` (see
   [Config resolution](#config-resolution)).
 
@@ -69,9 +71,11 @@ file selection in its `[sqlx-sqruff]` section (see
 [Selecting which files to scan](#selecting-which-files-to-scan)). Passing
 `--dialect` to them is an argument error (exit `2`).
 
-With `--check`, `fix` prints each query it would change: its `path:line`, the
-current literal with every line prefixed by `- `, then the fixed literal with
-every line prefixed by `+ `.
+With `--check`, `fix` prints, for each file it would change, a
+`would fix N query(ies) in <path>` line, then each query it would change: its
+`path:line`, the current literal with every line prefixed by `- `, then the
+fixed literal with every line prefixed by `+ `. Without `--check`, it prints a
+`fixed N query(ies) in <path>` line for each file it writes.
 
 `check` prints one line per finding, `path:line:col: CODE message`, or with
 `--format jsonl` one JSON object per finding; see [Output](#output).
@@ -84,7 +88,8 @@ Exit codes:
   could not apply, and still exits `0`.
 - Every command exits `2` on errors:
   - a path given on the command line that does not exist. This is checked
-    before any work, and each missing path is named.
+    before any work: each missing path is named, and the run stops there,
+    without a summary.
   - a path that selects no file to scan, so that a CI step cannot pass while
     checking nothing. Every directory you name must hold at least one `.rs`
     file that the [file selection](#selecting-which-files-to-scan) keeps; one
@@ -105,8 +110,9 @@ Exit codes:
     `error: <path>: ...` line (`error: <path>:<line>:<col>: ...` for a file
     that is not valid Rust).
 
-  For these errors, the run goes on with the other paths and files and still
-  prints its summary, and the exit code is `2` at the end.
+  For the last two kinds of errors, the run goes on with the other paths and
+  files, `check` and `fix` still print their summary, which counts the
+  errors, and the exit code is `2` at the end.
   - an invalid config, such as an unknown dialect, a `--config` file that
     cannot be read, or an invalid value in the `[sqlx-sqruff]` section.
   - an invalid argument, such as an unknown flag.
@@ -130,8 +136,15 @@ keep it on one line.
   a line break inside a one-line literal. Write the query as a multi-line raw
   string (`r#"`...`"#`), or disable the rule.
 - fixing the rewritten query again would change it further, so `fix` would
-  rewrite it on every run. See *Nested indentation needs block layout* under
-  [Known limitations](#known-limitations).
+  rewrite it on every run. When the SQL starts right after the opening quote
+  and continues on more lines of SQL, a layout rule can grow the indent of
+  those lines on every run, and the warning says to start the SQL on its own
+  line (see *Nested indentation needs block layout* under
+  [Known limitations](#known-limitations)). Otherwise sqruff's own fixes do
+  not settle on the query, for example when `ST09` swaps a join condition back
+  and forth, or when `LT05` and `LT09` undo each other's change with a short
+  `max_line_length`; the warning then says to disable one of the rules it
+  names.
 
 After rewriting a query, and before writing the file, `fix` lints and fixes the
 rewritten query again. When sqruff cannot fully parse the rewritten SQL, or one
@@ -140,9 +153,15 @@ fixed SQL no longer parses and counts the query as not applied. When sqruff
 still reports a finding there, because part
 of its fix needs a different line layout (for example the line breaks that
 `LT05` or `LT09` add to a one-line query), `fix` writes the part that fits,
-warns that the rest was not applied, and counts the query as not applied. The
-warnings name the rule codes sqruff still reports, and a later `fix --check`
-or `check` reports the same queries and rules.
+warns that the rest was not applied, and counts the query as not applied.
+
+The warnings about a line layout, and about a query that fixing again would
+change, name the rules whose fix was not applied: the fixable
+rules that `check` reports on the query as it stays in the file, which is the
+rewritten query when `fix` wrote part of its change and the original query
+when `fix` left it unchanged. A later `fix --check` or `check` reports the same
+queries and rules; `check` also reports the findings that sqruff cannot fix,
+which no warning names.
 
 `fix` writes each changed file through a temporary file in the same directory
 that then replaces the original, so an interrupted run never leaves a
@@ -208,7 +227,16 @@ system, so `src\a.rs` on Windows.
 
 Every command prints its results sorted by path, then line, then column. Paths
 are compared one component at a time, so `src/m/x.rs` comes before `src/m.rs`,
-and absolute paths come before relative ones.
+and absolute paths come before relative ones. The `error:` lines on stderr are
+sorted the same way, by the path they name, so naming the same paths in
+another order prints the same lines. The `warning:` and `note:` lines about a
+file come when that file is processed.
+
+`check` and `fix` end with a summary line on stderr:
+`N finding(s); E error(s).` for `check`, and
+`Q query(ies) in F file(s); N not applied; E error(s).` for `fix`, where with
+`--check` `Q` and `F` count what `fix` would change. `E` is the number of
+`error:` lines printed before it, each of which makes the run exit `2`.
 
 ### Config resolution
 
@@ -237,7 +265,9 @@ sqruff reads only its own sections (`[sqruff]`, `[sqruff:...]`, their
 When no config file sets an option there and no `--config` is given, sqruff's
 built-in default rules apply, and `check` and `fix` print a `note:` line on
 stderr saying so. This includes a project whose only config file holds just a
-`[sqlx-sqruff]` section.
+`[sqlx-sqruff]` section, and a run started outside the project: its `.sqruff`
+is not found even when the paths you name are inside it, so the note also says
+that config files are looked up from the current directory.
 
 The only value the tool injects is `dialect`, resolved in this order:
 
@@ -443,7 +473,10 @@ the rules `fix` must keep.
   that fixing it again would change it further, and counts it as not applied,
   so `fix --check` fails and `check` keeps reporting the rule. Start the SQL on
   its own line instead (`r#"`, newline, SQL) to let `fix` lay out the
-  indentation.
+  indentation. A query whose SQL already starts on its own line, or is all on
+  one line (even when the closing quote is on the next line), gets this
+  warning only when sqruff's own fixes do not settle on it; the warning then
+  says to disable one of the rules it names instead.
 - **Whitespace-only lines reach sqruff as written.** The Rust indentation is
   removed from each SQL line before linting and added back by `fix`, but a line
   that holds only whitespace is left exactly as it is, because it can be part

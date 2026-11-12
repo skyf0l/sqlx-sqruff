@@ -36,7 +36,16 @@ use sqlx_sqruff_core::{
 };
 
 #[derive(Parser)]
-#[command(name = "sqlx-sqruff", version, about)]
+#[command(
+    name = "sqlx-sqruff",
+    version,
+    about,
+    after_help = "Exit status:\n  \
+                  0  no findings, nothing to change, and no error\n  \
+                  1  check: one or more findings; fix --check: a file would change, or a\n     \
+                  needed change cannot be applied\n  \
+                  2  an error, each reported on an `error:` line (see each command's --help)"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -45,32 +54,42 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Lint inline SQL; non-zero exit if any findings.
-    #[command(after_help = exit_status("  0  no findings\n  1  one or more findings"))]
+    #[command(after_help = exit_status("  0  no findings\n  1  one or more findings", READ_ERRORS))]
     Check(CheckArgs),
     /// Apply fixes and write them back into the scanned files.
+    ///
+    /// The fixes of some rules can change what a query does; when one of them
+    /// is enabled, fix warns about it (see "Fixes that can change a query" in
+    /// the README).
     #[command(after_help = exit_status(
         "  0  without --check: no error, even when a change could not be applied (each\n     \
          is reported on a `warning:` line); with --check: nothing to change\n  \
-         1  with --check: a file would change, or a needed change cannot be applied"
+         1  with --check: a file would change, or a needed change cannot be applied",
+        "a file or directory that cannot be read,\n     or a fixed file that cannot be written"
     ))]
     Fix(FixArgs),
     /// Print every extracted query (debug).
-    #[command(after_help = exit_status("  0  no error"))]
+    #[command(after_help = exit_status("  0  no error", READ_ERRORS))]
     List(ListArgs),
     /// Print each query's SQL as the linter sees it (debug).
-    #[command(after_help = exit_status("  0  no error"))]
+    #[command(after_help = exit_status("  0  no error", READ_ERRORS))]
     Dump(ListArgs),
 }
 
+/// The I/O errors of a command that writes no file.
+const READ_ERRORS: &str = "a file or directory that cannot be read";
+
 /// The exit status list of a command's help: `codes`, the command's own lines,
-/// then the `2` that every command shares.
-fn exit_status(codes: &str) -> String {
+/// then the `2` that every command shares, with `io_errors` naming the I/O
+/// errors the command can meet.
+fn exit_status(codes: &str, io_errors: &str) -> String {
     format!(
         "Exit status:\n{codes}\n  \
          2  an error, each reported on an `error:` line: a path that does not exist\n     \
-         or selects no file to scan, a file that cannot be read or written, a file\n     \
-         that is not valid Rust (a file found by walking a directory is parsed only\n     \
-         when it contains the text `query`), or an invalid config or argument"
+         or selects no file to scan; {io_errors};\n     \
+         a file that is not valid Rust (a file found by walking a directory is\n     \
+         parsed only when it contains the text `query`); or an invalid config or\n     \
+         argument"
     )
 }
 
@@ -87,8 +106,10 @@ const RISKY_FIX_RULES_DOC: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "#fixes-
 struct ListArgs {
     #[arg(help = PATHS_HELP)]
     paths: Vec<PathBuf>,
-    /// Extra sqruff config file. Only its `[sqlx-sqruff]` section is used here,
-    /// to select the files.
+    /// Extra sqruff config file. Only its [sqlx-sqruff] section is used here,
+    /// to select the files; without one, the section comes from the config
+    /// files found by searching up from the current directory, not from the
+    /// paths to scan.
     #[arg(long)]
     config: Option<PathBuf>,
 }
@@ -96,8 +117,10 @@ struct ListArgs {
 /// Shared config flags (mirror sqruff): explicit config file + dialect default.
 #[derive(Parser)]
 struct ConfigOpts {
-    /// Extra sqruff config file, applied on top of the discovered ones (a
-    /// `.sqruff` and the other files sqruff reads).
+    /// Extra sqruff config file, applied on top of the config files that sqruff
+    /// discovers (a .sqruff and others, looked up from the current directory,
+    /// not from the paths to scan). Its [sqlx-sqruff] section, if it has one,
+    /// also selects the files.
     #[arg(long)]
     config: Option<PathBuf>,
     /// SQL dialect, overriding the config's `dialect` (postgres when neither
@@ -169,6 +192,18 @@ impl Errors {
         self.0 += 1;
     }
 
+    /// Whether the file at `path` was named on the command line, or `None`
+    /// after reporting the error that file collection found at `path`.
+    fn file(&mut self, path: &Path, found: Found) -> Option<bool> {
+        match found {
+            Found::File { named } => Some(named),
+            Found::Error(message) => {
+                self.report(path, message);
+                None
+            }
+        }
+    }
+
     /// The text of `path`, or `None` after reporting why it cannot be read.
     fn read(&mut self, path: &Path) -> Option<String> {
         fs::read_to_string(path).map_err(|e| self.report(path, e)).ok()
@@ -202,29 +237,32 @@ impl Errors {
     }
 }
 
-/// Report every explicitly given path that does not exist; `true` when all do.
-fn all_paths_exist(paths: &[PathBuf]) -> bool {
-    let mut all_exist = true;
+/// Report every explicitly given path that does not exist, in path order;
+/// `true` when all do.
+fn all_paths_exist(paths: &[PathBuf], errors: &mut Errors) -> bool {
+    let mut missing: Vec<(PathBuf, String)> = Vec::new();
     for path in paths {
         if let Err(e) = fs::metadata(path) {
-            if e.kind() == io::ErrorKind::NotFound {
-                eprintln!("error: {}: no such file or directory", shown(path).display());
-            } else {
-                eprintln!("error: {}: {e}", shown(path).display());
-            }
-            all_exist = false;
+            let message =
+                if e.kind() == io::ErrorKind::NotFound { "no such file or directory".to_string() } else { e.to_string() };
+            missing.push((shown(path), message));
         }
     }
-    all_exist
+    missing.sort();
+    for (path, message) in &missing {
+        errors.report(path, message);
+    }
+    missing.is_empty()
 }
 
 fn cmd_dump(a: ListArgs) -> Result<ExitCode> {
-    if !all_paths_exist(&a.paths) {
-        return Ok(ExitCode::from(2));
+    let mut errors = Errors::default();
+    if !all_paths_exist(&a.paths, &mut errors) {
+        return Ok(errors.exit_code(false));
     }
     let settings = CliSettings::load(a.config.as_deref())?;
-    let mut errors = Errors::default();
-    for (path, named) in collect_files(&a.paths, &settings, &mut errors)? {
+    for (path, found) in collect_files(&a.paths, &settings)? {
+        let Some(named) = errors.file(&path, found) else { continue };
         let Some(src) = errors.read(&path) else { continue };
         let Some(queries) = errors.extract(&path, &src, named) else { continue };
         for (line, sql) in dump_extracted(&queries) {
@@ -240,30 +278,25 @@ fn engine(cfg: &ConfigOpts) -> Result<SqruffEngine> {
     if !engine.config_found() {
         eprintln!(
             "note: no sqruff config found: no config file sets a sqruff option, so sqruff's \
-             default rules apply"
+             default rules apply; config files are looked up from the current directory, not \
+             from the paths to scan"
         );
     }
     Ok(engine)
 }
 
 fn cmd_check(a: CheckArgs) -> Result<ExitCode> {
-    if !all_paths_exist(&a.paths) {
-        return Ok(ExitCode::from(2));
+    let mut errors = Errors::default();
+    if !all_paths_exist(&a.paths, &mut errors) {
+        return Ok(errors.exit_code(false));
     }
     let engine = engine(&a.cfg)?;
     let settings = CliSettings::load(a.cfg.config.as_deref())?;
-    let mut errors = Errors::default();
     let mut total = 0usize;
-    let mut failed_files = 0usize;
-    for (path, named) in collect_files(&a.paths, &settings, &mut errors)? {
-        let Some(src) = errors.read(&path) else {
-            failed_files += 1;
-            continue;
-        };
-        let Some(queries) = errors.extract(&path, &src, named) else {
-            failed_files += 1;
-            continue;
-        };
+    for (path, found) in collect_files(&a.paths, &settings)? {
+        let Some(named) = errors.file(&path, found) else { continue };
+        let Some(src) = errors.read(&path) else { continue };
+        let Some(queries) = errors.extract(&path, &src, named) else { continue };
         let p = path.display().to_string();
         for d in check_extracted(&p, &src, &queries, &engine) {
             total += 1;
@@ -273,13 +306,14 @@ fn cmd_check(a: CheckArgs) -> Result<ExitCode> {
             }
         }
     }
-    eprintln!("{total} finding(s); {failed_files} file(s) failed.");
+    eprintln!("{total} finding(s); {} error(s).", errors.0);
     Ok(errors.exit_code(total > 0))
 }
 
 fn cmd_fix(a: FixArgs) -> Result<ExitCode> {
-    if !all_paths_exist(&a.paths) {
-        return Ok(ExitCode::from(2));
+    let mut errors = Errors::default();
+    if !all_paths_exist(&a.paths, &mut errors) {
+        return Ok(errors.exit_code(false));
     }
     let engine = engine(&a.cfg)?;
     let risky = engine.risky_fix_rules();
@@ -292,20 +326,13 @@ fn cmd_fix(a: FixArgs) -> Result<ExitCode> {
         );
     }
     let settings = CliSettings::load(a.cfg.config.as_deref())?;
-    let mut errors = Errors::default();
     let mut changed_files = 0usize;
     let mut changed_queries = 0usize;
     let mut not_applied = 0usize;
-    let mut failed_files = 0usize;
-    for (path, named) in collect_files(&a.paths, &settings, &mut errors)? {
-        let Some(src) = errors.read(&path) else {
-            failed_files += 1;
-            continue;
-        };
-        let Some(queries) = errors.extract(&path, &src, named) else {
-            failed_files += 1;
-            continue;
-        };
+    for (path, found) in collect_files(&a.paths, &settings)? {
+        let Some(named) = errors.file(&path, found) else { continue };
+        let Some(src) = errors.read(&path) else { continue };
+        let Some(queries) = errors.extract(&path, &src, named) else { continue };
         let p = path.display().to_string();
         match fix_extracted(&p, &src, &queries, &engine) {
             Ok(out) => {
@@ -321,30 +348,15 @@ fn cmd_fix(a: FixArgs) -> Result<ExitCode> {
                 for (line, message) in &out.sqruff_errors {
                     warnings.push((*line, format!("fix not applied: sqruff failed: {message}")));
                 }
-                // Each message is split where the rule codes go.
                 let with_codes = [
-                    (
-                        &out.layout_kept,
-                        "fix not applied: sqruff's change",
-                        " needs a different line layout; write the query as a multi-line raw \
-                         string (r#\"...\"#) or disable the rule",
-                    ),
-                    (
-                        &out.partly_applied,
-                        "fix partly applied: the rest of sqruff's change",
-                        " needs a different line layout and was not applied; write the query as a \
-                         multi-line raw string (r#\"...\"#) or disable the rule",
-                    ),
-                    (
-                        &out.unstable,
-                        "fix not applied: fixing the rewritten query again would change it further",
-                        "; start the SQL on its own line after the opening quote, or disable the \
-                         rule",
-                    ),
+                    (&out.layout_kept, NotApplied::Layout),
+                    (&out.partly_applied, NotApplied::PartLayout),
+                    (&out.unstable, NotApplied::Unstable),
+                    (&out.unsettled, NotApplied::Unsettled),
                 ];
-                for (entries, before, after) in with_codes {
+                for (entries, why) in with_codes {
                     for (line, codes) in entries {
-                        warnings.push((*line, format!("{before}{}{after}", rules(codes))));
+                        warnings.push((*line, not_applied_warning(why, codes)));
                     }
                 }
                 for line in &out.unparsable_lines {
@@ -379,7 +391,6 @@ fn cmd_fix(a: FixArgs) -> Result<ExitCode> {
                         }
                     } else if let Err(e) = write_atomically(&path, &new_src) {
                         errors.report(&path, e);
-                        failed_files += 1;
                     } else {
                         changed_files += 1;
                         changed_queries += out.changes.len();
@@ -387,24 +398,64 @@ fn cmd_fix(a: FixArgs) -> Result<ExitCode> {
                     }
                 }
             }
-            Err(e) => {
-                eprintln!("warning: {e}");
-                failed_files += 1;
+            Err(discarded) => {
+                eprintln!("warning: {}", discarded.message);
+                not_applied += discarded.not_applied;
             }
         }
     }
     eprintln!(
-        "{changed_queries} query(ies) in {changed_files} file(s); {not_applied} not applied; \
-         {failed_files} file(s) failed."
+        "{changed_queries} query(ies) in {changed_files} file(s); {not_applied} not applied; {} error(s).",
+        errors.0
     );
-    let needs_change = a.check && (changed_files > 0 || not_applied > 0 || failed_files > 0);
+    let needs_change = a.check && (changed_files > 0 || not_applied > 0);
     Ok(errors.exit_code(needs_change))
 }
 
-/// ` (LT05, LT09)` for the rule codes of a warning, or nothing when there are
-/// none.
-fn rules(codes: &[String]) -> String {
-    if codes.is_empty() { String::new() } else { format!(" ({})", codes.join(", ")) }
+/// Why `fix` did not apply the fix of a query, or only part of it, for the
+/// warnings that name the rules whose fix was not applied.
+#[derive(Clone, Copy)]
+enum NotApplied {
+    /// The fix needs a different line layout.
+    Layout,
+    /// The part of the fix that fits the line layout was applied.
+    PartLayout,
+    /// The SQL starts right after the opening quote, and fixing the rewritten
+    /// query again would change it further.
+    Unstable,
+    /// sqruff's own fixes do not settle on the query.
+    Unsettled,
+}
+
+/// The text of a `warning:` line about a query whose fix was not applied for
+/// `why`, naming the rule `codes` whose fix was not applied.
+fn not_applied_warning(why: NotApplied, codes: &[String]) -> String {
+    let named = !codes.is_empty();
+    let rules = if named { format!(" ({})", codes.join(", ")) } else { String::new() };
+    let the_rule = if named { "the rule" } else { "the rule that asks for the change" };
+    match why {
+        NotApplied::Layout => format!(
+            "fix not applied: sqruff's change{rules} needs a different line layout; write the query \
+             as a multi-line raw string (r#\"...\"#) or disable {the_rule}"
+        ),
+        NotApplied::PartLayout => format!(
+            "fix partly applied: the rest of sqruff's change{rules} needs a different line layout \
+             and was not applied; write the query as a multi-line raw string (r#\"...\"#) or \
+             disable {the_rule}"
+        ),
+        NotApplied::Unstable => format!(
+            "fix not applied: fixing the rewritten query again would change it further{rules}; \
+             start the SQL on its own line after the opening quote, or disable {the_rule}"
+        ),
+        NotApplied::Unsettled if named => format!(
+            "fix not applied: fixing the rewritten query again would change it further{rules}; \
+             sqruff's fixes for the named rules do not settle on this query, so disable one of them"
+        ),
+        NotApplied::Unsettled => "fix not applied: fixing the rewritten query again would change it \
+                                  further; sqruff's fixes do not settle on this query, so disable the \
+                                  rules that keep changing it"
+            .to_string(),
+    }
 }
 
 /// Replace the file at `path` (or, for a symlink, the file it points to) with
@@ -453,12 +504,13 @@ fn print_change(path: &str, change: &QueryChange) {
 }
 
 fn cmd_list(a: ListArgs) -> Result<ExitCode> {
-    if !all_paths_exist(&a.paths) {
-        return Ok(ExitCode::from(2));
+    let mut errors = Errors::default();
+    if !all_paths_exist(&a.paths, &mut errors) {
+        return Ok(errors.exit_code(false));
     }
     let settings = CliSettings::load(a.config.as_deref())?;
-    let mut errors = Errors::default();
-    for (path, named) in collect_files(&a.paths, &settings, &mut errors)? {
+    for (path, found) in collect_files(&a.paths, &settings)? {
+        let Some(named) = errors.file(&path, found) else { continue };
         let Some(src) = errors.read(&path) else { continue };
         let Some(queries) = errors.extract(&path, &src, named) else { continue };
         for q in queries {
@@ -468,9 +520,20 @@ fn cmd_list(a: ListArgs) -> Result<ExitCode> {
     Ok(errors.exit_code(false))
 }
 
-/// Discover the files to scan, each once, sorted by path and spelled as
-/// [`shown`] prints them, each with whether it was named on the command line
-/// rather than only found by walking a directory.
+/// What file collection found at a path.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum Found {
+    /// An error about the path. It sorts before a file at the same path, so it
+    /// is reported before that file is read.
+    Error(String),
+    /// A file to scan, and whether it was named on the command line rather
+    /// than only found by walking a directory.
+    File { named: bool },
+}
+
+/// Discover the files to scan, each once, together with the errors found at
+/// the paths, all sorted by path and spelled as [`shown`] prints them, so that
+/// the commands report both in path order.
 ///
 /// - A directly-named **file** path is always processed, whatever its
 ///   extension, bypassing include/exclude and the ignore files — naming a file
@@ -481,39 +544,37 @@ fn cmd_list(a: ListArgs) -> Result<ExitCode> {
 ///   finds below its root, but never the root itself.
 /// - The globs are relative to `settings.base()`, else to the walked directory.
 ///
-/// A directory that cannot be read is reported in `errors` and skipped. A
-/// search root that selects no file, and whose walk reported no error, is
-/// reported in `errors`, so that a run that misses a path it was given cannot
-/// pass.
-fn collect_files(
-    paths: &[PathBuf],
-    settings: &CliSettings,
-    errors: &mut Errors,
-) -> Result<Vec<(PathBuf, bool)>> {
+/// A directory that cannot be read is an error entry and is skipped. A search
+/// root that selects no file, and whose walk found no error, is an error
+/// entry, so that a run that misses a path it was given cannot pass.
+fn collect_files(paths: &[PathBuf], settings: &CliSettings) -> Result<Vec<(PathBuf, Found)>> {
     // `include` defines the default search set, so it only applies when the user
     // hasn't named their own paths. `exclude` always prunes.
     let use_include = paths.is_empty() && !settings.include.is_empty();
     let roots: Vec<PathBuf> =
         if paths.is_empty() { vec![PathBuf::from(".")] } else { paths.to_vec() };
+    // Whether a glob is valid does not depend on the directory it is relative
+    // to, so an invalid one stops the run before any path is looked at.
+    build_overrides(Path::new("."), settings, use_include).context("building file filters")?;
 
     // The index in `out` of each canonical path, so that a file found by a walk
     // and also named is marked as named, whichever root comes first.
     let mut seen: HashMap<PathBuf, usize> = HashMap::new();
-    let mut out: Vec<(PathBuf, bool)> = Vec::new();
+    let mut out: Vec<(PathBuf, Found)> = Vec::new();
     for root in &roots {
         let canonical_root = match root.canonicalize() {
             Ok(path) => path,
             Err(e) => {
-                errors.report(root, e);
+                out.push((shown(root), Found::Error(e.to_string())));
                 continue;
             }
         };
         if canonical_root.is_file() {
             match seen.entry(canonical_root) {
-                Entry::Occupied(at) => out[*at.get()].1 = true,
+                Entry::Occupied(at) => out[*at.get()].1 = Found::File { named: true },
                 Entry::Vacant(at) => {
                     at.insert(out.len());
-                    out.push((shown(root), true));
+                    out.push((shown(root), Found::File { named: true }));
                 }
             }
             continue;
@@ -537,7 +598,7 @@ fn collect_files(
         // Counts the files that another root already selected too, so that
         // naming a directory twice is not an error.
         let mut selected = 0usize;
-        let errors_before = errors.0;
+        let mut walk_errors = Vec::new();
         for entry in builder.build() {
             match entry {
                 Ok(entry) => {
@@ -546,26 +607,27 @@ fn collect_files(
                         selected += 1;
                         if let Entry::Vacant(at) = seen.entry(p.to_path_buf()) {
                             at.insert(out.len());
-                            out.push((shown(&under_root(root, &canonical_root, p)), false));
+                            out.push((shown(&under_root(root, &canonical_root, p)), Found::File { named: false }));
                         }
                     }
                 }
-                Err(err) => report_walk_error(root, &canonical_root, &err, errors),
+                Err(err) => walk_error(root, &canonical_root, &err, &mut walk_errors),
             }
         }
-        if selected == 0 && errors.0 == errors_before {
-            match settings.file.as_deref().filter(|_| use_include) {
-                Some(config) => errors.report(
-                    config,
-                    format_args!(
+        if selected == 0 && walk_errors.is_empty() {
+            walk_errors.push(match settings.file.as_deref().filter(|_| use_include) {
+                Some(config) => (
+                    shown(config),
+                    Found::Error(format!(
                         "no Rust files match the [sqlx-sqruff] include patterns, which are \
                          relative to {}",
                         shown(base).display()
-                    ),
+                    )),
                 ),
-                None => errors.report(root, "no Rust files found"),
-            }
+                None => (shown(root), Found::Error("no Rust files found".to_string())),
+            });
         }
+        out.append(&mut walk_errors);
     }
     out.sort();
     Ok(out)
@@ -577,18 +639,20 @@ fn under_root(root: &Path, canonical_root: &Path, path: &Path) -> PathBuf {
     path.strip_prefix(canonical_root).map_or_else(|_| path.to_path_buf(), |rel| root.join(rel))
 }
 
-fn report_walk_error(root: &Path, canonical_root: &Path, err: &ignore::Error, errors: &mut Errors) {
+/// Push to `out` an error entry for each error in `err`, from the walk of
+/// `root`.
+fn walk_error(root: &Path, canonical_root: &Path, err: &ignore::Error, out: &mut Vec<(PathBuf, Found)>) {
     match err {
         ignore::Error::Partial(errs) => {
             for err in errs {
-                report_walk_error(root, canonical_root, err, errors);
+                walk_error(root, canonical_root, err, out);
             }
         }
-        ignore::Error::WithDepth { err, .. } => report_walk_error(root, canonical_root, err, errors),
+        ignore::Error::WithDepth { err, .. } => walk_error(root, canonical_root, err, out),
         ignore::Error::WithPath { path, err } => {
-            errors.report(&under_root(root, canonical_root, path), walk_message(err));
+            out.push((shown(&under_root(root, canonical_root, path)), Found::Error(walk_message(err))));
         }
-        _ => errors.report(root, walk_message(err)),
+        _ => out.push((shown(root), Found::Error(walk_message(err)))),
     }
 }
 
@@ -668,7 +732,7 @@ mod tests {
     /// directory and so are printed resolved.
     fn collect_rel(paths: &[PathBuf], settings: &CliSettings, base: &Path) -> Vec<String> {
         let base = base.canonicalize().unwrap();
-        let mut got: Vec<String> = collect_files(paths, settings, &mut Errors::default())
+        let mut got: Vec<String> = collect_files(paths, settings)
             .unwrap()
             .into_iter()
             .map(|(p, _)| {
@@ -725,11 +789,24 @@ mod tests {
         // directly-named file.
         let settings = CliSettings { include: vec!["nomatch/**".into()], ..no_vcs() };
         let got: Vec<PathBuf> =
-            collect_files(std::slice::from_ref(&file), &settings, &mut Errors::default())
+            collect_files(std::slice::from_ref(&file), &settings)
                 .unwrap()
                 .iter()
                 .map(|(p, _)| p.canonicalize().unwrap())
                 .collect();
         assert_eq!(got, [file.canonicalize().unwrap()]);
+    }
+
+    #[test]
+    fn a_not_applied_warning_without_rule_codes_does_not_point_at_a_rule() {
+        let codes = ["LT05".to_string(), "LT09".to_string()];
+        for why in [NotApplied::Layout, NotApplied::PartLayout, NotApplied::Unstable, NotApplied::Unsettled] {
+            let unnamed = not_applied_warning(why, &[]);
+            assert!(!unnamed.contains("()"), "{unnamed}");
+            assert!(!unnamed.contains("named") && !unnamed.ends_with("the rule"), "{unnamed}");
+            assert!(unnamed.contains("disable"), "{unnamed}");
+            let named = not_applied_warning(why, &codes);
+            assert!(named.contains(" (LT05, LT09)"), "{named}");
+        }
     }
 }

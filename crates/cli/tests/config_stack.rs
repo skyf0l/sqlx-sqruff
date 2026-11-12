@@ -118,6 +118,7 @@ fn a_note_says_when_no_config_file_sets_a_sqruff_option() {
             let notes = notes(&out);
             assert_eq!(notes.len(), 1, "{sqruff:?} {args:?}: {}", report(&out));
             assert!(notes[0].contains("default"), "{sqruff:?} {args:?}: {}", report(&out));
+            assert!(notes[0].contains("current directory"), "{sqruff:?} {args:?}: {}", report(&out));
             let stdout = String::from_utf8_lossy(&out.stdout);
             assert!(!stdout.contains("note:"), "{sqruff:?} {args:?}: {}", report(&out));
             if args.contains(&"jsonl") {
