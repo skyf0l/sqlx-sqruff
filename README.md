@@ -102,6 +102,17 @@ keep it on one line.
 - sqruff's fix needs a different line layout than the literal has, for example
   a line break inside a one-line literal. Write the query as a multi-line raw
   string (`r#"`...`"#`), or disable the rule.
+- fixing the rewritten query again would change it further, so `fix` would
+  rewrite it on every run. See *Nested indentation needs block layout* under
+  [Known limitations](#known-limitations).
+
+After rewriting a query, and before writing the file, `fix` lints and fixes the
+rewritten query again. When sqruff still reports a finding there, because part
+of its fix needs a different line layout (for example the line breaks that
+`LT05` or `LT09` add to a one-line query), `fix` writes the part that fits,
+warns that the rest was not applied, and counts the query as not applied. The
+warnings name the rule codes sqruff still reports, and a later `fix --check`
+or `check` reports the same queries and rules.
 
 `fix` writes each changed file through a temporary file in the same directory
 that then replaces the original, so an interrupted run never leaves a
@@ -275,11 +286,16 @@ the rules `fix` must keep.
   rewrites it, and `fix --check` fails when such a query needs changes. Write
   the query as a raw string (`r#"..."#`) to let `fix` format it.
 - **Nested indentation needs block layout.** When the first SQL line sits
-  right after the opening quote, `fix` keeps every following line at the
-  indent you gave it. If all of those lines are indented further than the
-  first one, as in `"SELECT\n        a,\n        b"`, a layout rule such as `LT02`
-  can keep reporting an indent that `fix` will not change. Start the SQL on its
-  own line instead (`r#"`, newline, SQL) to let `fix` lay out the indentation.
+  right after the opening quote, the indent that all following lines share is
+  removed before linting and added back by `fix`, so the least indented of
+  those lines stays where you put it. If a layout rule such as `LT02` wants
+  every following line indented further, as in
+  `"SELECT a FROM t WHERE\n            b = 1"`, applying that would only grow
+  the shared indent on every run. `fix` then leaves the query unchanged, warns
+  that fixing it again would change it further, and counts it as not applied,
+  so `fix --check` fails and `check` keeps reporting the rule. Start the SQL on
+  its own line instead (`r#"`, newline, SQL) to let `fix` lay out the
+  indentation.
 - **Whitespace-only lines reach sqruff as written.** The Rust indentation is
   removed from each SQL line before linting and added back by `fix`, but a line
   that holds only whitespace is left exactly as it is, because it can be part

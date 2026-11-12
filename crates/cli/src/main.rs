@@ -268,11 +268,28 @@ fn cmd_fix(a: FixArgs) -> Result<ExitCode> {
                 for (line, message) in &out.sqruff_errors {
                     eprintln!("warning: {p}:{line}: fix not applied: sqruff failed: {message}");
                 }
-                for line in &out.layout_kept_lines {
+                for (line, codes) in &out.layout_kept {
                     eprintln!(
-                        "warning: {p}:{line}: fix not applied: sqruff's change needs a different \
+                        "warning: {p}:{line}: fix not applied: sqruff's change{} needs a different \
                          line layout; write the query as a multi-line raw string (r#\"...\"#) or \
-                         disable the rule"
+                         disable the rule",
+                        rules(codes)
+                    );
+                }
+                for (line, codes) in &out.partly_applied {
+                    eprintln!(
+                        "warning: {p}:{line}: fix partly applied: the rest of sqruff's change{} \
+                         needs a different line layout and was not applied; write the query as a \
+                         multi-line raw string (r#\"...\"#) or disable the rule",
+                        rules(codes)
+                    );
+                }
+                for (line, codes) in &out.unstable {
+                    eprintln!(
+                        "warning: {p}:{line}: fix not applied: fixing the rewritten query again \
+                         would change it further{}; start the SQL on its own line after the \
+                         opening quote, or disable the rule",
+                        rules(codes)
                     );
                 }
                 for line in &out.unparsable_lines {
@@ -290,11 +307,7 @@ fn cmd_fix(a: FixArgs) -> Result<ExitCode> {
                         out.skipped_escapes
                     );
                 }
-                not_applied += out.dropped_lines.len()
-                    + out.sqruff_errors.len()
-                    + out.skipped_escapes
-                    + out.layout_kept_lines.len()
-                    + out.unparsable_lines.len();
+                not_applied += out.not_applied();
                 if let Some(new_src) = out.new_src {
                     if a.check {
                         changed_files += 1;
@@ -325,6 +338,12 @@ fn cmd_fix(a: FixArgs) -> Result<ExitCode> {
     );
     let needs_change = a.check && (changed_files > 0 || not_applied > 0 || failed_files > 0);
     Ok(errors.exit_code(needs_change))
+}
+
+/// ` (LT05, LT09)` for the rule codes of a warning, or nothing when there are
+/// none.
+fn rules(codes: &[String]) -> String {
+    if codes.is_empty() { String::new() } else { format!(" ({})", codes.join(", ")) }
 }
 
 /// Replace the file at `path` (or, for a symlink, the file it points to) with

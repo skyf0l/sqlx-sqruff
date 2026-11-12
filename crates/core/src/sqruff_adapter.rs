@@ -119,12 +119,13 @@ impl SqruffEngine {
         Ok(lf.violations().iter().map(Finding::from).collect())
     }
 
-    /// Fix; returns `(fixed_sql, residual_unfixable_findings)`, or sqruff's
-    /// message as in [`lint`](Self::lint).
+    /// Fix; returns `(fixed_sql, findings)`, where `findings` are the findings
+    /// sqruff reported on its first pass over `sql`, fixable or not, or
+    /// sqruff's message as in [`lint`](Self::lint).
     pub fn fix(&self, sql: &str) -> Result<(String, Vec<Finding>), String> {
         let lf = self.linter.lint_string(sql, None, true).map_err(|e| e.to_string())?;
-        let residual = lf.violations().iter().filter(|v| !v.fixable).map(Finding::from).collect();
-        Ok((lf.fix_string(), residual))
+        let findings = lf.violations().iter().map(Finding::from).collect();
+        Ok((lf.fix_string(), findings))
     }
 }
 

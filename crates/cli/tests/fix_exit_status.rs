@@ -215,6 +215,51 @@ fn a_fix_that_needs_a_different_line_layout_fails_fix_check_and_is_reported() {
     assert_eq!(p.src(), src);
 }
 
+/// The `N` of the `N not applied` count in the summary that `fix` prints.
+fn not_applied_count(out: &Output) -> usize {
+    let err = stderr(out);
+    let summary = err
+        .lines()
+        .find(|l| l.contains(" not applied;") && l.contains(" file(s) failed;"))
+        .unwrap_or_else(|| panic!("no summary in:\n{err}"));
+    let before = summary.split(" not applied;").next().unwrap_or_default();
+    before.rsplit(' ').next().and_then(|n| n.parse().ok()).unwrap_or_else(|| panic!("no count in {summary:?}"))
+}
+
+#[test]
+fn a_fix_whose_line_breaks_cannot_be_applied_is_counted_as_not_applied_by_fix_and_fix_check() {
+    // sqruff removes the double space and breaks the too-long line; a one-line
+    // literal can take the first change but not the second.
+    let src = "fn f() {\n    let _ = sqlx::query!(\"INSERT INTO flow (workspace_id, path, summary, description, value, edited_by, schema, tag) VALUES  ($1, $2, $3, $4, $5, $6, $7, $8)\");\n}\n";
+    let p = Project::new("partly_applied", "[sqruff]\ndialect = postgres\nrules = LT01,LT05\n", src);
+
+    let fix = p.run(&["fix"]);
+    assert_eq!(fix.status.code(), Some(0), "{}", stderr(&fix));
+    assert!(p.src().contains("VALUES ($1"), "{}", p.src());
+    assert_eq!(not_applied_count(&fix), 1, "{}", stderr(&fix));
+    let warnings = lines_naming(&fix, &p.file, 2);
+    assert!(warnings.iter().any(|l| l.contains("not applied") && l.contains("LT05")), "{}", stderr(&fix));
+    let fixed = p.src();
+
+    let fix_check = p.run(&["fix", "--check"]);
+    assert_eq!(fix_check.status.code(), Some(1), "{}", stderr(&fix_check));
+    assert!(!String::from_utf8_lossy(&fix_check.stdout).contains("would fix"), "{}", String::from_utf8_lossy(&fix_check.stdout));
+    assert_eq!(not_applied_count(&fix_check), not_applied_count(&fix), "{}", stderr(&fix_check));
+    let warnings = lines_naming(&fix_check, &p.file, 2);
+    assert!(warnings.iter().any(|l| l.contains("not applied") && l.contains("LT05")), "{}", stderr(&fix_check));
+
+    let check = p.run(&["check"]);
+    assert_eq!(check.status.code(), Some(1), "{}", stderr(&check));
+    let at = format!("{}:2:", p.file.display());
+    let findings = String::from_utf8_lossy(&check.stdout).into_owned();
+    assert!(findings.lines().all(|l| l.starts_with(&at) && l.contains("LT05")), "{findings}");
+
+    let again = p.run(&["fix"]);
+    assert_eq!(again.status.code(), Some(0), "{}", stderr(&again));
+    assert_eq!(not_applied_count(&again), not_applied_count(&fix), "{}", stderr(&again));
+    assert_eq!(p.src(), fixed);
+}
+
 #[test]
 fn an_invalid_config_value_is_an_error_not_a_crash() {
     let p = Project::new("bad_value", "[sqruff]\ndialect = postgres\nmax_line_length = abc\n", "fn f() {}\n");
