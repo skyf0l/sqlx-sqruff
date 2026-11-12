@@ -1,8 +1,6 @@
 [package]
 name = "sqlx-sqruff-core"
-# Versioned on its own: the CLI is the stable interface, this library is its
-# engine and makes no API stability promise.
-version = "0.3.0-rc.1"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
