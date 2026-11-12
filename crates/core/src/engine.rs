@@ -686,6 +686,9 @@ mod tests {
             "fn f() {\n    let _ = sqlx::query(\"SELECT \\\"a\\\"  FROM t WHERE x = NULL\");\n}\n",
             "fn f() {\n    let _ = sqlx::query(\n        \"SELECT \\\"a\\\"\n         FROM t\n         WHERE x = NULL\",\n    );\n}\n",
             "fn f() {\n    let _ = sqlx::query!(\n        r#\"\n        insert into notes (body) values ('a\n        \n   \n  \n          \n        b'),  ('x')\n        \"#\n    );\n}\n",
+            "fn f() {\n    tokio::select! {\n        r = sqlx::query!(\"select  a from t where x = null\").fetch_one(p) => r,\n        r = sqlx::query_as::<_, Row>(r#\"\n            select  b\n                from t where x = null\n        \"#).fetch_one(p) => r,\n    }\n}\n",
+            "macro_rules! m {\n    ($p:expr) => {\n        sqlx::query_as!(Row, r#\"\n            select  a\n                from t where x = null\n        \"#).fetch_one($p)\n    };\n    () => { $crate::sqlx::query(\"select  a from t where x = null\") };\n}\n",
+            "fn f() {\n    let _ = crate::db::sqlx::query(\"select  a from t where x = null\");\n    let _ = ::app::sqlx::query_scalar!(\"select  a\n        from t where x = null\");\n}\n",
         ];
         // Shapes whose fix `fix` cannot apply: every finding left must be on a
         // literal that both runs report as not applied.
@@ -695,6 +698,7 @@ mod tests {
         let eng = layout_engine();
         let shapes = fixtures.iter().map(|src| (src, false));
         for (src, expect_not_applied) in shapes.chain(not_applied_fixtures.iter().map(|src| (src, true))) {
+            assert!(!extract(src).is_empty(), "no query found in:\n{src}");
             let first = fix_file("f.rs", src, &eng).unwrap();
             let fixed = first.new_src.clone().unwrap_or_else(|| src.to_string());
             let again = fix_file("f.rs", &fixed, &eng).unwrap();
@@ -741,6 +745,15 @@ mod tests {
         let out = fix_file("f.rs", src, &eng).unwrap();
         assert_eq!(out.new_src, None);
         assert!(out.changes.is_empty() && out.layout_kept.is_empty() && out.unparsable_lines.is_empty());
+    }
+
+    #[test]
+    fn a_call_to_a_local_named_like_an_imported_function_is_neither_checked_nor_fixed() {
+        let src = "use sqlx::query;\npub fn search(index: &Index) -> Vec<String> {\n    let query = |text: &str| index.lookup(text);\n    query(\"select   name from   people\")\n}\n";
+        let eng = layout_engine();
+        let diags = check_file("f.rs", src, &eng);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(fix_file("f.rs", src, &eng).unwrap().new_src, None);
     }
 
     #[test]
