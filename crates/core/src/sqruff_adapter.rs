@@ -61,6 +61,25 @@ impl From<&SQLBaseError> for Finding {
     }
 }
 
+impl Finding {
+    /// `desc`, with the line of the SQL that it quotes, if any, replaced by
+    /// `line` of it. Of sqruff's messages, only AL08's quotes one:
+    /// `Reuse of column alias 'a' from line 6.`
+    pub fn message(&self, line: impl FnOnce(usize) -> usize) -> String {
+        let quoted = if self.code == "AL08" {
+            self.desc.strip_suffix('.').and_then(|desc| desc.rsplit_once(" from line "))
+        } else {
+            None
+        };
+        if let Some((head, n)) = quoted
+            && let Ok(n) = n.parse()
+        {
+            return format!("{head} from line {}.", line(n));
+        }
+        self.desc.clone()
+    }
+}
+
 /// The code of a sqruff finding. sqruff reports lexing errors as `LXR` and
 /// every other finding without a rule as `????`: parse errors, unreadable
 /// `-- noqa` comments and rules that failed. Those are told apart by the

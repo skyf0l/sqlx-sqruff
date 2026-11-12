@@ -60,15 +60,17 @@ pub fn check_extracted(
                 continue;
             }
         };
+        let rs_position = |line, col| {
+            index.line_col(src, q.start_byte + lit.source_offset(view.content_index(line, col)))
+        };
         for f in findings {
-            let at = q.start_byte + lit.source_offset(view.content_index(f.line, f.col));
-            let (line, col) = index.line_col(src, at);
+            let (line, col) = rs_position(f.line, f.col);
             diags.push(Diagnostic {
                 file: path.to_string(),
                 line,
                 col,
+                message: f.message(|sql_line| rs_position(sql_line, 1).0),
                 code: f.code,
-                message: f.desc,
             });
         }
     }
@@ -636,6 +638,31 @@ mod tests {
     fn position_after_newline_escape_stays_on_the_source_line() {
         let src = "fn f() {\n    let _ = sqlx::query!(\"SELECT a\\nFROM t WHERE x = NULL\");\n}\n";
         assert_eq!(positions(src), [(2, 52, "CV05".to_string())]);
+    }
+
+    #[test]
+    fn a_sql_line_quoted_in_a_message_is_given_as_the_rs_line() {
+        let eng = SqruffEngine::from_source("[sqruff]\ndialect = postgres\nrules = AL08\n").unwrap();
+        let src = concat!(
+            "fn f() {\n",
+            "    let _ = sqlx::query!(r#\"\n",
+            "        SELECT\n",
+            "            a AS x,\n",
+            "            b AS x\n",
+            "        FROM t\n",
+            "    \"#);\n",
+            "    let _ = sqlx::query!(\"SELECT a AS y,\n",
+            "        b AS y FROM t\");\n",
+            "    let _ = sqlx::query!(\"SELECT a AS z, b AS z FROM t\");\n",
+            "}\n",
+        );
+        let found: Vec<(usize, String)> =
+            check_file("f.rs", src, &eng).into_iter().map(|d| (d.line, d.message)).collect();
+        assert_eq!(found.len(), 3, "{found:?}");
+        for (line, alias, from) in [(5, "x", 4), (9, "y", 8), (10, "z", 10)] {
+            let tail = format!("'{alias}' from line {from}.");
+            assert!(found.iter().any(|(l, m)| *l == line && m.ends_with(&tail)), "{tail:?} at {line} in {found:?}");
+        }
     }
 
     #[test]
