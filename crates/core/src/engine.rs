@@ -748,6 +748,7 @@ mod tests {
             "fn f() {\n    tokio::select! {\n        r = sqlx::query!(\"select  a from t where x = null\").fetch_one(p) => r,\n        r = sqlx::query_as::<_, Row>(r#\"\n            select  b\n                from t where x = null\n        \"#).fetch_one(p) => r,\n    }\n}\n",
             "macro_rules! m {\n    ($p:expr) => {\n        sqlx::query_as!(Row, r#\"\n            select  a\n                from t where x = null\n        \"#).fetch_one($p)\n    };\n    () => { $crate::sqlx::query(\"select  a from t where x = null\") };\n}\n",
             "fn f() {\n    let _ = crate::db::sqlx::query(\"select  a from t where x = null\");\n    let _ = ::app::sqlx::query_scalar!(\"select  a\n        from t where x = null\");\n}\n",
+            "fn f() {\n    let _ = sqlx::query!(\"update  t set a = $1\", sqlx::query_scalar!(r#\"\n        select  max(a)\n            from t where x = null\n    \"#).fetch_one(p));\n}\n",
         ];
         // Shapes whose fix `fix` cannot apply: every finding left must be on a
         // literal that both runs report as not applied.
