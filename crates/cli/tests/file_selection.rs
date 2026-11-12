@@ -282,6 +282,60 @@ fn a_file_named_twice_is_processed_once() {
     assert_eq!(stdout.lines().filter(|l| l.contains("a.rs:")).count(), 1, "{}", report(&out));
 }
 
+const COMMANDS: [&[&str]; 5] = [&["check"], &["fix", "--check"], &["fix"], &["list"], &["dump"]];
+
+#[test]
+fn a_run_that_selects_no_rust_file_is_an_error_naming_the_searched_paths() {
+    let config = "[sqruff]\ndialect = postgres\nrules = CV05\n\n[sqlx-sqruff]\ninclude = nomatch/**/*.rs\n";
+    let p = Project::new("nothing_selected", &[(".sqruff", config), ("a.rs", CV05_QUERY), ("empty/notes.txt", QUERY)]);
+    for command in COMMANDS {
+        for (paths, searched) in [(&["empty"][..], "empty"), (&[], ".")] {
+            let out = p.run("", &[command, paths].concat());
+            assert_eq!(out.status.code(), Some(2), "{command:?} {paths:?}: {}", report(&out));
+            let errors = stderr_lines(&out, "error:", &["no Rust files"]);
+            assert_eq!(errors.len(), 1, "{command:?} {paths:?}: {}", report(&out));
+            assert!(errors[0].ends_with(&format!(" {searched}")), "{command:?} {paths:?}: {}", report(&out));
+            assert!(out.stdout.is_empty(), "{command:?} {paths:?}: {}", report(&out));
+        }
+    }
+    assert_eq!(fs::read_to_string(p.path("a.rs")).unwrap(), CV05_QUERY);
+}
+
+#[test]
+fn a_named_file_is_scanned_whatever_its_extension() {
+    let p = Project::new(
+        "named_txt",
+        &[(".sqruff", "[sqruff]\ndialect = postgres\nrules = CV05\n"), ("a.rs", QUERY), ("foo.txt", CV05_QUERY)],
+    );
+    let out = p.run("", &["list", "foo.txt"]);
+    assert_eq!(listed(&out, &p.0), p.files(&["foo.txt"]), "{}", report(&out));
+    let walked = p.run("", &["list", "."]);
+    assert_eq!(listed(&walked, &p.0), p.files(&["a.rs"]), "{}", report(&walked));
+
+    let check = p.run("", &["check", "foo.txt"]);
+    assert_eq!(check.status.code(), Some(1), "{}", report(&check));
+    let stdout = String::from_utf8_lossy(&check.stdout);
+    assert!(stdout.lines().any(|l| l.starts_with("foo.txt:2:") && l.contains("CV05")), "{}", report(&check));
+}
+
+#[test]
+fn a_gitignored_directory_is_scanned_when_named_and_pruned_when_walked() {
+    let p = Project::new(
+        "named_ignored_dir",
+        &[(".gitignore", "gen/\n*.skip.rs\n"), ("a.rs", QUERY), ("gen/g.rs", QUERY), ("gen/h.skip.rs", QUERY)],
+    );
+    for walk in [&["list"][..], &["list", "."]] {
+        let out = p.run("", walk);
+        assert_eq!(listed(&out, &p.0), p.files(&["a.rs"]), "{walk:?}: {}", report(&out));
+    }
+    // The named directory is scanned, but the ignore rules still apply to what
+    // the walk finds inside it.
+    let named = p.run("", &["list", "gen"]);
+    assert_eq!(listed(&named, &p.0), p.files(&["gen/g.rs"]), "{}", report(&named));
+    let from_inside = p.run("gen", &["list"]);
+    assert_eq!(listed(&from_inside, &p.path("gen")), p.files(&["gen/g.rs"]), "{}", report(&from_inside));
+}
+
 #[test]
 fn gitignore_is_honoured_outside_a_git_repository() {
     let p = Project::new(

@@ -42,8 +42,8 @@ pub struct Finding {
     pub col: usize,
     pub desc: String,
     pub fixable: bool,
-    /// A lexing or parsing error rather than a rule violation: part of the SQL
-    /// did not parse with the configured dialect.
+    /// A lexing or parsing error, or a rule that failed inside sqruff, rather
+    /// than a rule violation: a fix computed for this SQL cannot be trusted.
     pub unparsable: bool,
 }
 
@@ -56,7 +56,7 @@ impl From<&SQLBaseError> for Finding {
             col: e.line_pos,
             desc: e.desc().to_string(),
             fixable: e.fixable,
-            unparsable: code == PARSE || code == LEX,
+            unparsable: code == PARSE || code == LEX || code == INTERNAL,
         }
     }
 }
@@ -260,6 +260,19 @@ mod tests {
             codes(&engine, "SELECT a FROM t WHERE x = NULL -- noqa:\n"),
             [("CV05".to_string(), false), ("NOQA".to_string(), false)]
         );
+    }
+
+    #[test]
+    fn a_rule_that_failed_inside_sqruff_is_internal_and_blocks_fix() {
+        // No known SQL makes a sqruff 0.44 rule fail, so the finding is built
+        // the way its linter builds one.
+        let failed = SQLBaseError {
+            description: "Unexpected exception. Could you open an issue".to_string(),
+            ..SQLBaseError::default()
+        };
+        let finding = Finding::from(&failed);
+        assert_eq!(finding.code, INTERNAL);
+        assert!(finding.unparsable);
     }
 
     #[test]

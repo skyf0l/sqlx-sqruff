@@ -43,13 +43,13 @@ const QUERY_FUNCTIONS: &[&str] = &[
 
 /// Extract every inline query literal. Returns empty (not an error) if the file
 /// does not parse; use [`extract_checked`] to distinguish "no queries" from
-/// "file didn't parse" so callers can warn instead of silently skipping.
+/// "file didn't parse" so callers can report it instead of silently skipping.
 pub fn extract(src: &str) -> Vec<QueryLiteral> {
     extract_checked(src).unwrap_or_default()
 }
 
-/// Like [`extract`], but returns the `syn` parse error so callers can warn that
-/// a whole file was skipped (rather than hiding its queries).
+/// Like [`extract`], but returns the `syn` parse error so callers can report
+/// that a whole file was skipped (rather than hiding its queries).
 pub fn extract_checked(src: &str) -> Result<Vec<QueryLiteral>, String> {
     // Cheap byte-substring gate before the expensive `syn::parse_file`: every
     // supported macro and function name (`query`, `query_as`, ...) contains
@@ -703,7 +703,7 @@ fn f() {
     #[test]
     fn pre_filter_still_errors_on_unparsable_file_with_query() {
         // Contains "query" -> syn must still run, so a genuine parse failure is
-        // surfaced (the CLI turns this into a skip warning).
+        // surfaced (the CLI reports it as an error naming the file).
         assert!(extract_checked("query! this is not rust {{{").is_err());
     }
 }

@@ -107,17 +107,14 @@ fn fix_check_shows_each_query_before_and_after() {
 }
 
 #[test]
-fn list_and_dump_warn_about_a_file_that_does_not_parse() {
+fn list_and_dump_report_a_file_that_does_not_parse_as_an_error() {
     let src = "fn f() {\n    let _ = sqlx::query!(\"SELECT 1\");\n";
     let p = Project::new("unparsable", CV05, src);
-    let file = format!(" {FILE} ");
+    let file = format!("error: {FILE}: ");
     for command in ["list", "dump"] {
         let out = p.run(&[command]);
-        assert!(
-            stderr(&out).lines().any(|l| l.starts_with("warning:") && l.contains(&file)),
-            "{command}: {}",
-            stderr(&out)
-        );
+        assert_eq!(out.status.code(), Some(2), "{command}: {}", stderr(&out));
+        assert!(stderr(&out).lines().any(|l| l.starts_with(&file)), "{command}: {}", stderr(&out));
     }
 }
 
@@ -223,7 +220,7 @@ fn not_applied_count(out: &Output) -> usize {
     let err = stderr(out);
     let summary = err
         .lines()
-        .find(|l| l.contains(" not applied;") && l.contains(" file(s) failed;"))
+        .find(|l| l.contains(" not applied;") && l.contains(" file(s) failed."))
         .unwrap_or_else(|| panic!("no summary in:\n{err}"));
     let before = summary.split(" not applied;").next().unwrap_or_default();
     before.rsplit(' ').next().and_then(|n| n.parse().ok()).unwrap_or_else(|| panic!("no count in {summary:?}"))

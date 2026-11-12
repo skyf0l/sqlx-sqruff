@@ -88,6 +88,31 @@ fn a_file_that_is_not_utf8_is_named_and_the_run_continues() {
     assert!(stderr_has(&check, "", "finding(s)"), "{}", report(&check));
 }
 
+#[test]
+fn a_file_that_does_not_parse_as_rust_is_an_error_naming_it_and_the_run_continues() {
+    let unparsable = b"fn f() {\n    let _ = sqlx::query!(\"SELECT a FROM t WHERE x = NULL\");\n";
+    let p = Project::new(
+        "unparsable",
+        &[("a.rs", FIXABLE.as_bytes()), ("b.rs", unparsable), ("c.rs", FIXABLE.as_bytes())],
+    );
+    for command in [&["check"][..], &["fix", "--check"], &["list"], &["dump"], &["fix"]] {
+        let mut args = command.to_vec();
+        args.extend(["a.rs", "b.rs", "c.rs"]);
+        let out = p.run(&args);
+        assert_eq!(out.status.code(), Some(2), "{command:?}: {}", report(&out));
+        assert!(stderr_has(&out, "error: b.rs:", "Rust"), "{command:?}: {}", report(&out));
+        assert!(!stderr_has(&out, "warning:", "b.rs"), "{command:?}: {}", report(&out));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for file in ["a.rs", "c.rs"] {
+            assert!(stdout.contains(file), "{command:?} {file}: {}", report(&out));
+        }
+    }
+    assert_eq!(fs::read(p.0.join("b.rs")).unwrap(), unparsable);
+    for fixed in ["a.rs", "c.rs"] {
+        assert_ne!(fs::read(p.0.join(fixed)).unwrap(), FIXABLE.as_bytes(), "{fixed}");
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn a_file_that_cannot_be_written_is_named_and_fix_continues() {

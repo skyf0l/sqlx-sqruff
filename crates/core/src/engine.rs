@@ -111,8 +111,9 @@ pub struct FixOutcome {
     /// would change it further, so `fix` would never converge on it.
     pub unstable: Vec<(usize, Vec<String>)>,
     /// 1-based `.rs` lines of literals whose SQL did not fully parse with the
-    /// configured dialect; sqruff's fixes for them were not applied, because a
-    /// fix built on a wrong parse can change what the query does.
+    /// configured dialect, or on which a sqruff rule failed; sqruff's fixes for
+    /// them were not applied, because a fix built on a wrong parse can change
+    /// what the query does.
     pub unparsable_lines: Vec<usize>,
 }
 
