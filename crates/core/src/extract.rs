@@ -130,7 +130,7 @@ impl<'ast> Visit<'ast> for Visitor {
 
     fn visit_macro(&mut self, m: &'ast syn::Macro) {
         if self.is_query_path(&m.path, Namespace::Macro) {
-            if let Some(lit) = first_string_literal(m.tokens.clone()) {
+            if let Some(lit) = sql_literal(m.tokens.clone()) {
                 self.found.push(lit);
             }
         } else if let Ok(args) =
@@ -338,18 +338,22 @@ impl Scope {
     }
 }
 
-/// First string literal in the token stream; naturally skips a leading struct
+/// The first string literal in the token stream, which skips a leading struct
 /// ident + comma (`query_as!(Row, r#"..."#)`) and stops before bind-arg literals.
-fn first_string_literal(tokens: proc_macro2::TokenStream) -> Option<Literal> {
-    for tt in tokens {
-        if let TokenTree::Literal(l) = tt {
+/// `None` when that literal is not a whole argument on its own: sqlx joins
+/// literals written with `+`, and rewriting one of them alone can break the query.
+fn sql_literal(tokens: proc_macro2::TokenStream) -> Option<Literal> {
+    let is_comma = |tt: &TokenTree| matches!(tt, TokenTree::Punct(p) if p.as_char() == ',');
+    let tokens: Vec<TokenTree> = tokens.into_iter().collect();
+    let (at, lit) = tokens.iter().enumerate().find_map(|(i, tt)| match tt {
+        TokenTree::Literal(l) => {
             let s = l.to_string();
-            if s.starts_with('"') || s.starts_with("r\"") || s.starts_with("r#") {
-                return Some(l);
-            }
+            (s.starts_with('"') || s.starts_with("r\"") || s.starts_with("r#")).then_some((i, l))
         }
-    }
-    None
+        _ => None,
+    })?;
+    let whole = (at == 0 || is_comma(&tokens[at - 1])) && tokens.get(at + 1).is_none_or(is_comma);
+    whole.then(|| lit.clone())
 }
 
 #[cfg(test)]
@@ -441,6 +445,21 @@ fn f() {
 }
 "###;
         assert!(texts(src).is_empty());
+    }
+
+    #[test]
+    fn ignores_macros_whose_sql_is_not_a_single_string_literal() {
+        // sqlx joins literals written with `+`; one of them alone is not the query.
+        let src = r###"
+fn f() {
+    let _ = sqlx::query!("SELECT  id " + "FROM users WHERE id = $1", 1);
+    let _ = sqlx::query_as!(Row, "SELECT a " + r#"FROM t"# + "", x);
+    let _ = sqlx::query_scalar!(r#"SELECT 1"#
+        + "", "bind");
+    let _ = sqlx::query!("SELECT 3", "a" + "b");
+}
+"###;
+        assert_eq!(texts(src), ["\"SELECT 3\""]);
     }
 
     #[test]

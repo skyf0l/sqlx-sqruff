@@ -119,6 +119,30 @@ fn list_and_dump_warn_about_a_file_that_does_not_parse() {
 }
 
 #[test]
+fn a_query_split_into_literals_joined_with_plus_is_skipped_by_every_command() {
+    let src = "fn f() {\n    let _ = sqlx::query!(\"SELECT  id \" + \"FROM users WHERE id = $1\", 1);\n}\n";
+    let p = Project::new("plus", "[sqruff]\ndialect = postgres\nrules = LT01,CV05\n", src);
+    let at = format!("{}:2", p.file.display());
+
+    let check = p.run(&["check"]);
+    assert_eq!(check.status.code(), Some(0), "{}", stderr(&check));
+    assert!(!String::from_utf8_lossy(&check.stdout).contains(&at), "{}", String::from_utf8_lossy(&check.stdout));
+
+    for args in [&["fix", "--check"][..], &["fix"]] {
+        let out = p.run(args);
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {}", stderr(&out));
+        assert!(lines_naming(&out, &p.file, 2).is_empty(), "{args:?}: {}", stderr(&out));
+        assert_eq!(p.src(), src, "{args:?}");
+    }
+
+    for command in ["list", "dump"] {
+        let out = p.run(&[command]);
+        assert_eq!(out.status.code(), Some(0), "{command}: {}", stderr(&out));
+        assert!(!String::from_utf8_lossy(&out.stdout).contains(&at), "{command}: {}", String::from_utf8_lossy(&out.stdout));
+    }
+}
+
+#[test]
 fn a_dropped_edit_fails_fix_check_and_is_reported_by_fix() {
     // Quoting identifiers inside `r"..."` would end the raw string early.
     let config = "[sqruff]\ndialect = postgres\nrules = RF06\n\n\

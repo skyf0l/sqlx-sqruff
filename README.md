@@ -246,10 +246,11 @@ the rules `fix` must keep.
   such as `.execute("...")` are not extracted.
 - **The SQL must be a single string literal written in the call.** The query
   is read from one string literal, so a query string assembled some other way
-  (a `concat!(...)`, a `const`, a variable, `format!`, `AssertSqlSafe(...)`, or
-  runtime concatenation) is not extracted. Such calls are skipped without a
-  warning. Bind-argument literals that follow the SQL, including
-  `.bind("...")`, are correctly left alone.
+  (several literals joined with `+`, as in `sqlx::query!("SELECT a " + "FROM t")`,
+  a `concat!(...)`, a `const`, a variable, `format!`, `AssertSqlSafe(...)`, or
+  runtime concatenation) is not extracted: `check`, `fix`, `list` and `dump`
+  all skip such calls without a warning. Bind-argument literals that follow the
+  SQL, including `.bind("...")`, are correctly left alone.
 - **A bare name must be imported from sqlx.** A macro or call written without
   the `sqlx::` prefix, such as `query!(...)` or `query("...")`, is extracted
   only when that name is imported from sqlx in the same module or in an
@@ -279,6 +280,12 @@ the rules `fix` must keep.
   first one, as in `"SELECT\n        a,\n        b"`, a layout rule such as `LT02`
   can keep reporting an indent that `fix` will not change. Start the SQL on its
   own line instead (`r#"`, newline, SQL) to let `fix` lay out the indentation.
+- **Whitespace-only lines reach sqruff as written.** The Rust indentation is
+  removed from each SQL line before linting and added back by `fix`, but a line
+  that holds only whitespace is left exactly as it is, because it can be part
+  of a SQL string value. A whitespace-only line outside a string value, such as
+  an indented blank line between two clauses, is therefore reported by `LT01`
+  as trailing whitespace, and `fix` empties it.
 - **Whole-file skip on unparsable Rust.** If `syn` can't parse a file, it is
   skipped with a warning (never silently), and no queries from it are linted.
 

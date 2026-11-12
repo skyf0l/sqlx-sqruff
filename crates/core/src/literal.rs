@@ -152,8 +152,9 @@ fn unicode_escape(chars: &mut Peekable<CharIndices>) -> Option<char> {
 pub struct LintView {
     pub sql: String,
     /// The whitespace prefix removed from the start of each line of `sql`
-    /// (except a first line stuck to the opening delimiter). [`reindent`] and
-    /// [`reindent_keep_first`] add exactly this string back.
+    /// (except whitespace-only lines and a first line stuck to the opening
+    /// delimiter). [`reindent`] and [`reindent_keep_first`] add exactly this
+    /// string back.
     pub indent: String,
     /// Content char index that each `sql` char came from.
     origin: Vec<usize>,
@@ -166,12 +167,13 @@ pub struct LintView {
 impl LintView {
     /// Strip leading newlines, trailing whitespace and the leading whitespace
     /// prefix common to every non-blank line, so sqruff sees column-1 SQL. A
-    /// whitespace-only line loses that prefix too and keeps the rest of its
-    /// whitespace, since it can be part of a string constant; one that does not
-    /// start with the prefix is kept as is. When the first SQL line is stuck to
-    /// the opening delimiter and more lines follow, that first line has no
-    /// indent of its own, so it is kept as is and the prefix is taken from the
-    /// continuation lines only. This is the same split `fix` uses to re-indent.
+    /// whitespace-only line is kept exactly as written: it can be part of a
+    /// string constant, and once the prefix was removed from it, re-indenting
+    /// could not tell an empty line from one that held only the prefix. When
+    /// the first SQL line is stuck to the opening delimiter and more lines
+    /// follow, that first line has no indent of its own, so it is kept as is
+    /// and the prefix is taken from the continuation lines only. This is the
+    /// same split `fix` uses to re-indent.
     pub fn new(content: &str) -> Self {
         let chars: Vec<char> = content.chars().collect();
         let start = chars.iter().take_while(|&&c| c == '\n').count();
@@ -215,7 +217,7 @@ impl LintView {
                 view.push('\n', line.start - 1);
                 view.line_starts.push(view.origin.len());
             }
-            let keeps_indent = (stuck && n == 0) || !chars[line.clone()].starts_with(indent);
+            let keeps_indent = (stuck && n == 0) || is_blank(line);
             let skip = if keeps_indent { 0 } else { indent.len() };
             for i in line.clone().skip(skip) {
                 view.push(chars[i], i);
@@ -259,20 +261,21 @@ pub fn framing(content: &str) -> (String, String) {
     (leading, trailing)
 }
 
-/// Prefix every non-empty line of `sql` with `indent`, the inverse of the
-/// de-indentation in [`LintView::new`] for a literal whose SQL starts on its
-/// own line.
+/// Prefix every line of `sql` that is not whitespace-only with `indent`, the
+/// inverse of the de-indentation in [`LintView::new`] for a literal whose SQL
+/// starts on its own line.
 pub fn reindent(sql: &str, indent: &str) -> String {
     sql.trim_end_matches('\n')
         .lines()
-        .map(|l| if l.is_empty() { String::new() } else { format!("{indent}{l}") })
+        .map(|l| if l.trim().is_empty() { l.to_string() } else { format!("{indent}{l}") })
         .collect::<Vec<_>>()
         .join("\n")
 }
 
 /// Re-indent `sql` for a literal whose first line is stuck to the opening
-/// delimiter: the first line stays as is, and every other non-empty line is
-/// prefixed with `indent`, the inverse of [`LintView::new`] for such a literal.
+/// delimiter: the first line stays as is, and every other line that is not
+/// whitespace-only is prefixed with `indent`, the inverse of [`LintView::new`]
+/// for such a literal.
 pub fn reindent_keep_first(sql: &str, indent: &str) -> String {
     let body = sql.trim_end_matches('\n');
     match body.split_once('\n') {
@@ -414,12 +417,12 @@ mod tests {
     }
 
     #[test]
-    fn lint_view_keeps_whitespace_beyond_the_prefix_on_blank_lines() {
+    fn lint_view_keeps_whitespace_only_lines_as_written() {
         let c = "\n    SELECT 'a\n      \n  \n    b'\n";
         let view = LintView::new(c);
         assert_eq!(view.indent, "    ");
-        assert_eq!(view.sql, "SELECT 'a\n  \n  \nb'\n");
-        assert_eq!(view.content_index(2, 2), c.find("      ").unwrap() + 5);
+        assert_eq!(view.sql, "SELECT 'a\n      \n  \nb'\n");
+        assert_eq!(view.content_index(2, 2), c.find("      ").unwrap() + 1);
         assert_eq!(view.content_index(3, 1), c.find("\n  \n").unwrap() + 1);
         assert_eq!(view.content_index(4, 1), c.find("b'").unwrap());
     }
@@ -432,6 +435,9 @@ mod tests {
             "\n\n    \t SELECT 1\n\n    \t   FROM t\n",
             "SELECT 'p\n          \n     \t  q' AS b\n        FROM t",
             "SELECT a\n\tFROM t\n\tWHERE x = 1\n  ",
+            "\n        SELECT 'a\n        \n   \n  \n          \n\n        b' AS c\n        ",
+            "SELECT 'a\n        \n   \n  \n          \n\n        b' AS c\n        FROM t",
+            "\n\n        \n        SELECT 1\n",
         ] {
             let view = LintView::new(c);
             let (leading, trailing) = framing(c);
