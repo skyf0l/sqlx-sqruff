@@ -57,10 +57,16 @@ covered by tests:
   - it is a normal string using escapes other than `\"` and `\\`;
   - sqruff's change needs a different line layout (one-line literals stay on one
     line);
-  - the rebuilt literal fails the value check.
+  - the rebuilt literal fails the value check;
+  - fixing the rebuilt literal again would change it further.
 - `check` and `fix` must agree: after `fix`, `check` must not report a finding
   that `fix` could have applied, and a second `fix` must change nothing. Add new
   literal shapes to `fix_converges_with_check_for_every_literal_shape`.
+- `recheck` in `engine.rs` lints and fixes every rebuilt literal again before
+  it is written, as the next run would. A rebuilt literal that sqruff still
+  reports findings on is counted as not applied, with its rule codes, so the
+  summary of `fix` matches what `fix --check` and `check` report afterwards.
+  Keep that call the one place every rebuilt literal passes through.
 - Literal parsing must match the compiler. Add new escape or delimiter cases to
   `content_matches_the_compiler_value`, which compares with `syn`'s
   `LitStr::value()`.

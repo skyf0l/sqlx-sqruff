@@ -7,7 +7,7 @@ use crate::{
     extract::{QueryLiteral, extract},
     line_index::LineIndex,
     literal::{self, LintView, LiteralKind, ParsedLiteral},
-    sqruff_adapter::SqruffEngine,
+    sqruff_adapter::{Finding, SqruffEngine},
 };
 
 /// Debug: return each pre-extracted query's `(line, sql)` as the linter sees it.
@@ -97,14 +97,36 @@ pub struct FixOutcome {
     /// 1-based `.rs` line and first line of sqruff's error message for each
     /// literal sqruff could not process; those literals were left untouched.
     pub sqruff_errors: Vec<(usize, String)>,
-    /// 1-based `.rs` lines of literals that sqruff changed but whose literal
-    /// could not be rewritten in its current line layout (for example a
-    /// one-liner whose fix needs line breaks); those fixes were not applied.
-    pub layout_kept_lines: Vec<usize>,
+    /// 1-based `.rs` line and fixable rule codes of literals that sqruff
+    /// changed but that could not be rewritten in their current line layout
+    /// (for example a one-liner whose fix needs line breaks); those fixes were
+    /// not applied.
+    pub layout_kept: Vec<(usize, Vec<String>)>,
+    /// 1-based `.rs` line, and the fixable rule codes sqruff still reports, of
+    /// rewritten literals that only took the part of sqruff's change that fits
+    /// their line layout; the rest was not applied.
+    pub partly_applied: Vec<(usize, Vec<String>)>,
+    /// 1-based `.rs` line, and the fixable rule codes sqruff still reports, of
+    /// literals left untouched because fixing the rewritten literal again
+    /// would change it further, so `fix` would never converge on it.
+    pub unstable: Vec<(usize, Vec<String>)>,
     /// 1-based `.rs` lines of literals whose SQL did not fully parse with the
     /// configured dialect; sqruff's fixes for them were not applied, because a
     /// fix built on a wrong parse can change what the query does.
     pub unparsable_lines: Vec<usize>,
+}
+
+impl FixOutcome {
+    /// The number of literals whose fix was not applied, or only in part.
+    pub fn not_applied(&self) -> usize {
+        self.skipped_escapes
+            + self.dropped_lines.len()
+            + self.sqruff_errors.len()
+            + self.layout_kept.len()
+            + self.partly_applied.len()
+            + self.unstable.len()
+            + self.unparsable_lines.len()
+    }
 }
 
 /// Fix every inline query and splice back, preserving each literal's line-shape
@@ -131,7 +153,9 @@ pub fn fix_extracted(
     let mut skipped_escapes = 0;
     let mut dropped_lines = Vec::new();
     let mut sqruff_errors = Vec::new();
-    let mut layout_kept_lines = Vec::new();
+    let mut layout_kept = Vec::new();
+    let mut partly_applied = Vec::new();
+    let mut unstable = Vec::new();
     let mut unparsable_lines = Vec::new();
     for q in queries {
         let Some(lit) = ParsedLiteral::parse(&q.text) else {
@@ -141,7 +165,7 @@ pub fn fix_extracted(
         if view.sql.trim().is_empty() || is_skippable(&view.sql) {
             continue;
         }
-        let (fixed, residual) = match engine.fix(&view.sql) {
+        let (fixed, findings) = match engine.fix(&view.sql) {
             Ok(result) => result,
             Err(e) => {
                 sqruff_errors.push((q.line, first_line(&e).to_string()));
@@ -151,7 +175,7 @@ pub fn fix_extracted(
         if fixed == view.sql {
             continue;
         }
-        if residual.iter().any(|f| f.unparsable) {
+        if findings.iter().any(|f| f.unparsable) {
             unparsable_lines.push(q.line);
             continue;
         }
@@ -159,21 +183,29 @@ pub fn fix_extracted(
             skipped_escapes += 1;
             continue;
         }
-        let Some(mut content) = rebuild_content(&lit, &view.indent, &fixed) else {
-            layout_kept_lines.push(q.line);
+        let Some((new_literal, content)) = rebuild_literal(&lit, &view.indent, &fixed) else {
+            layout_kept.push((q.line, fixable_codes(&findings)));
             continue;
         };
-        if lit.crlf {
-            content = content.replace('\n', "\r\n");
-        }
-        let new_literal = wrap(&lit, &content);
         if new_literal == q.text {
-            layout_kept_lines.push(q.line);
+            layout_kept.push((q.line, fixable_codes(&findings)));
             continue;
         }
         if !has_value(&new_literal, &content) {
             dropped_lines.push(q.line);
             continue;
+        }
+        match recheck(&new_literal, engine) {
+            Ok(Recheck::Clean) => {}
+            Ok(Recheck::Residual(codes)) => partly_applied.push((q.line, codes)),
+            Ok(Recheck::Unstable(codes)) => {
+                unstable.push((q.line, codes));
+                continue;
+            }
+            Err(e) => {
+                sqruff_errors.push((q.line, first_line(&e).to_string()));
+                continue;
+            }
         }
         changes.push(QueryChange { line: q.line, before: q.text.clone(), after: new_literal.clone() });
         edits.push((q.start_byte, q.end_byte, new_literal));
@@ -186,7 +218,9 @@ pub fn fix_extracted(
             skipped_escapes,
             dropped_lines,
             sqruff_errors,
-            layout_kept_lines,
+            layout_kept,
+            partly_applied,
+            unstable,
             unparsable_lines,
         });
     }
@@ -209,9 +243,60 @@ pub fn fix_extracted(
         skipped_escapes,
         dropped_lines,
         sqruff_errors,
-        layout_kept_lines,
+        layout_kept,
+        partly_applied,
+        unstable,
         unparsable_lines,
     })
+}
+
+/// What sqruff still wants to change in a rewritten literal.
+enum Recheck {
+    Clean,
+    /// sqruff still reports these rules, but its fix rebuilds into the same
+    /// literal: the rest of its change needs a different line layout.
+    Residual(Vec<String>),
+    /// Fixing the literal again would rewrite it once more; sqruff reports
+    /// these rules.
+    Unstable(Vec<String>),
+}
+
+/// Lint and fix a rewritten `literal` the way the next `fix` run would, so
+/// that this run reports what that run would still find. A literal that cannot
+/// be read back counts as unstable.
+fn recheck(literal: &str, engine: &SqruffEngine) -> Result<Recheck, String> {
+    let Some(lit) = ParsedLiteral::parse(literal) else {
+        return Ok(Recheck::Unstable(Vec::new()));
+    };
+    let view = LintView::new(&lit.content);
+    let (fixed, findings) = engine.fix(&view.sql)?;
+    if fixed == view.sql {
+        return Ok(Recheck::Clean);
+    }
+    let codes = fixable_codes(&findings);
+    match rebuild_literal(&lit, &view.indent, &fixed) {
+        Some((again, _)) if again != literal => Ok(Recheck::Unstable(codes)),
+        _ => Ok(Recheck::Residual(codes)),
+    }
+}
+
+/// The distinct codes of the fixable findings, sorted.
+fn fixable_codes(findings: &[Finding]) -> Vec<String> {
+    let mut codes: Vec<String> =
+        findings.iter().filter(|f| f.fixable).map(|f| f.code.clone()).collect();
+    codes.sort();
+    codes.dedup();
+    codes
+}
+
+/// The source text of `lit` rebuilt around fixed SQL, and its intended value.
+/// `None` as for [`rebuild_content`].
+fn rebuild_literal(lit: &ParsedLiteral, indent: &str, fixed: &str) -> Option<(String, String)> {
+    let mut content = rebuild_content(lit, indent, fixed)?;
+    if lit.crlf {
+        content = content.replace('\n', "\r\n");
+    }
+    Some((wrap(lit, &content), content))
 }
 
 /// Whether `literal` parses as a single string literal whose value is `content`.
@@ -574,12 +659,21 @@ mod tests {
             "fn f() {\n    let _ = sqlx::query(\n        \"SELECT \\\"a\\\"\n         FROM t\n         WHERE x = NULL\",\n    );\n}\n",
             "fn f() {\n    let _ = sqlx::query!(\n        r#\"\n        insert into notes (body) values ('a\n        \n   \n  \n          \n        b'),  ('x')\n        \"#\n    );\n}\n",
         ];
+        // Shapes whose fix `fix` cannot apply: every finding left must be on a
+        // literal that both runs report as not applied.
+        let not_applied_fixtures = [
+            "fn f() {\n    let _ = sqlx::query!(\"SELECT a FROM t WHERE\n            b = 1\");\n}\n",
+        ];
         let eng = layout_engine();
-        for src in fixtures {
-            let fixed =
-                fix_file("f.rs", src, &eng).unwrap().new_src.unwrap_or_else(|| src.to_string());
+        let shapes = fixtures.iter().map(|src| (src, false));
+        for (src, expect_not_applied) in shapes.chain(not_applied_fixtures.iter().map(|src| (src, true))) {
+            let first = fix_file("f.rs", src, &eng).unwrap();
+            let fixed = first.new_src.clone().unwrap_or_else(|| src.to_string());
             let again = fix_file("f.rs", &fixed, &eng).unwrap();
             assert_eq!(again.new_src, None, "second fix changed:\n{fixed}");
+            assert_eq!(again.not_applied(), first.not_applied(), "{fixed}");
+            assert_eq!(again.not_applied() > 0, expect_not_applied, "{fixed}");
+            let reported = not_applied_lines(&again);
             for q in extract(&fixed) {
                 let lit = ParsedLiteral::parse(&q.text).unwrap();
                 let fixable: Vec<_> = eng
@@ -589,9 +683,25 @@ mod tests {
                     .filter(|f| f.fixable)
                     .map(|f| f.code)
                     .collect();
-                assert!(fixable.is_empty(), "{fixable:?} left in:\n{fixed}");
+                assert!(fixable.is_empty() || reported.contains(&q.line), "{fixable:?} left in:\n{fixed}");
             }
         }
+    }
+
+    fn lines(entries: &[(usize, Vec<String>)]) -> Vec<usize> {
+        entries.iter().map(|(line, _)| *line).collect()
+    }
+
+    /// The lines of every literal that `fix` reported as not applied, except
+    /// those skipped for their escapes, which are only counted.
+    fn not_applied_lines(out: &FixOutcome) -> Vec<usize> {
+        let mut all = out.dropped_lines.clone();
+        all.extend(out.sqruff_errors.iter().map(|(line, _)| *line));
+        all.extend(lines(&out.layout_kept));
+        all.extend(lines(&out.partly_applied));
+        all.extend(lines(&out.unstable));
+        all.extend(&out.unparsable_lines);
+        all
     }
 
     #[test]
@@ -602,7 +712,7 @@ mod tests {
         assert!(diags.is_empty(), "{diags:?}");
         let out = fix_file("f.rs", src, &eng).unwrap();
         assert_eq!(out.new_src, None);
-        assert!(out.changes.is_empty() && out.layout_kept_lines.is_empty() && out.unparsable_lines.is_empty());
+        assert!(out.changes.is_empty() && out.layout_kept.is_empty() && out.unparsable_lines.is_empty());
     }
 
     #[test]
@@ -647,7 +757,7 @@ mod tests {
         );
         let out = fix_file("f.rs", src, &cv05_engine()).unwrap();
         assert_eq!(out.new_src, None);
-        assert!(out.changes.is_empty() && out.layout_kept_lines.is_empty());
+        assert!(out.changes.is_empty() && out.layout_kept.is_empty());
     }
 
     #[test]
@@ -718,7 +828,8 @@ mod tests {
             SqruffEngine::from_source("[sqruff]\ndialect = postgres\nrules = LT09,CV05\n").unwrap();
         let src = "fn f() {\n    let _ = sqlx::query!(\"SELECT a, b FROM t WHERE x = NULL -- note\");\n    let _ = sqlx::query!(\"SELECT a, b FROM t WHERE x = NULL\");\n}\n";
         let out = fix_file("f.rs", src, &eng).unwrap();
-        assert_eq!(out.layout_kept_lines, [2]);
+        assert_eq!(lines(&out.layout_kept), [2]);
+        assert_eq!(out.partly_applied, [(3, vec!["LT09".to_string()])]);
         let fixed = out.new_src.expect("the second literal is fixed");
         assert!(fixed.contains("x = NULL -- note"), "{fixed}");
         assert!(fixed.contains("\"SELECT a, b FROM t WHERE x IS NULL\""), "{fixed}");
@@ -731,7 +842,38 @@ mod tests {
         assert!(!check_file("f.rs", src, &eng).is_empty());
         let out = fix_file("f.rs", src, &eng).unwrap();
         assert_eq!(out.new_src, None);
-        assert_eq!(out.layout_kept_lines, [2]);
+        assert_eq!(lines(&out.layout_kept), [2]);
+    }
+
+    #[test]
+    fn a_one_liner_whose_fix_also_adds_line_breaks_takes_the_rest_and_reports_them() {
+        let eng =
+            SqruffEngine::from_source("[sqruff]\ndialect = postgres\nrules = LT01,LT05\n").unwrap();
+        let src = "fn f() {\n    let _ = sqlx::query!(\"INSERT INTO flow (workspace_id, path, summary, description, value, edited_by) VALUES  ($1, $2, $3, $4, $5, $6)\");\n}\n";
+        let first = fix_file("f.rs", src, &eng).unwrap();
+        let fixed = first.new_src.clone().expect("the double space is removed");
+        assert!(fixed.contains("VALUES ($1"), "{fixed}");
+        assert_eq!(first.partly_applied, [(2, vec!["LT05".to_string()])]);
+        assert_eq!(first.not_applied(), 1);
+
+        let second = fix_file("f.rs", &fixed, &eng).unwrap();
+        assert_eq!(second.new_src, None);
+        assert_eq!(second.layout_kept, [(2, vec!["LT05".to_string()])]);
+        assert_eq!(second.not_applied(), first.not_applied());
+    }
+
+    #[test]
+    fn a_stuck_first_line_whose_fix_indents_every_following_line_is_left_untouched() {
+        // The continuation lines lose their common indent before linting, and
+        // LT02 asks for it again on every run.
+        let src = "fn f() {\n    let _ = sqlx::query!(\"SELECT a FROM t WHERE\n            b = NULL\");\n}\n";
+        let eng = layout_engine();
+        assert!(check_file("f.rs", src, &eng).iter().any(|d| d.code == "LT02" && d.line == 3));
+        let out = fix_file("f.rs", src, &eng).unwrap();
+        assert_eq!(out.new_src, None);
+        assert_eq!(lines(&out.unstable), [2]);
+        assert!(out.unstable[0].1.contains(&"LT02".to_string()), "{:?}", out.unstable);
+        assert_eq!(out.not_applied(), 1);
     }
 
     #[test]
