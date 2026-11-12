@@ -107,8 +107,9 @@ fn a_path_that_does_not_exist_is_an_error_naming_it_before_any_work() {
         args.extend(["a.rs", "missing", "src/typo"]);
         let out = p.run("", &args);
         assert_eq!(out.status.code(), Some(2), "{command:?}: {}", report(&out));
-        for missing in ["missing", "src/typo"] {
-            let lines = stderr_lines(&out, "error:", &[missing, "no such file or directory"]);
+        for missing in [PathBuf::from("missing"), Path::new("src").join("typo")] {
+            let missing = format!("error: {}: ", missing.display());
+            let lines = stderr_lines(&out, "error:", &[&missing, "no such file or directory"]);
             assert_eq!(lines.len(), 1, "{command:?}: {}", report(&out));
         }
         assert!(out.stdout.is_empty(), "{command:?}: {}", report(&out));

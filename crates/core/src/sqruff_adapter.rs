@@ -29,10 +29,14 @@ use sqruff_lib_core::{
     errors::SQLBaseError,
 };
 
+use crate::diagnostic::{INTERNAL, LEX, NOQA, PARSE};
+
 /// A single lint finding, 1-based line / 1-based col in chars *within the SQL
 /// given to sqruff*.
 #[derive(Debug, Clone)]
 pub struct Finding {
+    /// The sqruff rule code, or one of the codes in [`crate::diagnostic`] for
+    /// a finding that is not a rule violation.
     pub code: String,
     pub line: usize,
     pub col: usize,
@@ -45,14 +49,29 @@ pub struct Finding {
 
 impl From<&SQLBaseError> for Finding {
     fn from(e: &SQLBaseError) -> Self {
+        let code = code(e);
         Self {
-            code: e.rule_code().to_string(),
+            code: code.to_string(),
             line: e.line_no,
             col: e.line_pos,
             desc: e.desc().to_string(),
             fixable: e.fixable,
-            unparsable: e.rule.is_none(),
+            unparsable: code == PARSE || code == LEX,
         }
+    }
+}
+
+/// The code of a sqruff finding. sqruff reports lexing errors as `LXR` and
+/// every other finding without a rule as `????`: parse errors, unreadable
+/// `-- noqa` comments and rules that failed. Those are told apart by the
+/// messages sqruff gives them.
+fn code(e: &SQLBaseError) -> &'static str {
+    match &e.rule {
+        Some(rule) if rule.code == "LXR" => LEX,
+        Some(rule) => rule.code,
+        None if e.desc().starts_with("Malformed 'noqa' section") => NOQA,
+        None if e.desc().starts_with("Unexpected exception") => INTERNAL,
+        None => PARSE,
     }
 }
 
@@ -223,6 +242,24 @@ mod tests {
                 .unwrap_or_else(|| panic!("accepted {config:?}"));
             assert!(err.contains(problem), "{config:?}: {err}");
         }
+    }
+
+    fn codes(engine: &SqruffEngine, sql: &str) -> Vec<(String, bool)> {
+        engine.lint(sql).unwrap().into_iter().map(|f| (f.code, f.unparsable)).collect()
+    }
+
+    #[test]
+    fn findings_that_are_not_rules_get_codes_pinned_byte_for_byte() {
+        let engine = SqruffEngine::from_source("[sqruff]\ndialect = postgres\nrules = CV05\n").unwrap();
+        assert_eq!(codes(&engine, "SELECT FROM WHERE ((\n"), [("PARSE".to_string(), true)]);
+        assert_eq!(
+            codes(&engine, "SELECT 'abc\n"),
+            [("LEX".to_string(), true), ("PARSE".to_string(), true)]
+        );
+        assert_eq!(
+            codes(&engine, "SELECT a FROM t WHERE x = NULL -- noqa:\n"),
+            [("CV05".to_string(), false), ("NOQA".to_string(), false)]
+        );
     }
 
     #[test]

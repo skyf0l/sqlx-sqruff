@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 
+use crate::paths::shown;
+
 const SECTION: &str = "sqlx-sqruff";
 /// The INI-format files sqruff reads in each directory, in its load order: a
 /// later file overrides an earlier one.
@@ -79,17 +81,18 @@ impl CliSettings {
 
     /// The section of the config file at `path`, or `None` when it has none.
     fn load_file(path: &Path) -> Result<Option<Self>> {
+        let shown = shown(path);
         let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading config {}", path.display()))?;
-        let Some(section) = parse(&text).map_err(|e| anyhow!("{}: {e}", path.display()))? else {
+            .with_context(|| format!("reading config {}", shown.display()))?;
+        let Some(section) = parse(&text).map_err(|e| anyhow!("{}: {e}", shown.display()))? else {
             return Ok(None);
         };
         for key in &section.unknown_keys {
-            eprintln!("warning: {}: unknown key '{key}' in [{SECTION}]", path.display());
+            eprintln!("warning: {}: unknown key '{key}' in [{SECTION}]", shown.display());
         }
         let file = path
             .canonicalize()
-            .with_context(|| format!("resolving config {}", path.display()))?;
+            .with_context(|| format!("resolving config {}", shown.display()))?;
         Ok(Some(Self { base: file.parent().map(Path::to_path_buf), ..section.settings }))
     }
 }

@@ -30,3 +30,6 @@ sqlx-sqruff-core.workspace = true
 clap.workspace = true
 ignore.workspace = true
 anyhow.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
