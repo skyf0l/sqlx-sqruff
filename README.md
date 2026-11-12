@@ -320,8 +320,10 @@ the rules `fix` must keep.
   (several literals joined with `+`, as in `sqlx::query!("SELECT a " + "FROM t")`,
   a `concat!(...)`, a `const`, a variable, `format!`, `AssertSqlSafe(...)`, or
   runtime concatenation) is not extracted: `check`, `fix`, `list` and `dump`
-  all skip such calls without a warning. Bind-argument literals that follow the
-  SQL, including `.bind("...")`, are correctly left alone.
+  all skip such calls without a warning. The SQL is the first argument, or for
+  `query_as!` and `query_as_unchecked!` the argument after the record type, so
+  bind-argument literals that follow the SQL, including `.bind("...")`, are
+  correctly left alone.
 - **A bare name must be imported from sqlx.** A macro or call written without
   the `sqlx::` prefix, such as `query!(...)` or `query("...")`, is extracted
   only when that name is imported from sqlx in the same module or in an
@@ -332,11 +334,40 @@ the rules `fix` must keep.
   same name hides a `use sqlx::*;`. A bare macro also counts when the same
   file has `#[macro_use] extern crate sqlx;` at its top level. Method calls such as
   `client.query("...")` are never extracted.
+- **A local variable hides an imported function of the same name.** After
+  `use sqlx::query;`, the call in `let query = |text| lookup(text);
+  query("...")` is not extracted. A `let` hides the import from the next
+  statement to the end of its block; a function or closure parameter, for the
+  whole body; a binding in a `match` arm, `if let`, `while let` or `for`
+  pattern, for that arm or body. A variable in an inner block does not hide
+  the import outside that block, and `sqlx::query("...")` written with its
+  path is still extracted. Variables do not hide macros, so `query!(...)` still
+  counts.
 - **A crate alias counts as sqlx.** After `use sqlx as db;` (in the same module
   or an enclosing block) or `extern crate sqlx as db;` (at the top level of
   the same file),
   `db::query!(...)` and `db::query("...")` are extracted like their `sqlx::`
   forms.
+- **sqlx re-exported under another path counts.** A path whose last two
+  segments are `sqlx` and a query function or macro name counts, whatever comes
+  before them: `crate::db::sqlx::query!(...)`, `::app::sqlx::query("...")`. So
+  does an import through such a path (`use crate::db::sqlx::query;`). A module
+  of your own named `sqlx` with a function named `query` is therefore taken for
+  sqlx. An alias of sqlx reached through a longer path, such as
+  `crate::db::query(...)` when `db` is sqlx renamed, is not recognised.
+- **Macros whose arguments are not Rust expressions are searched by their
+  tokens.** In a macro such as `tokio::select! { r = sqlx::query!("...").fetch_one(&pool) => r }`,
+  every `PATH!(...)` and `PATH(...)` among its tokens is checked with the rules
+  above, and each `{ ... }`, `( ... )` or `[ ... ]` group that parses as a Rust
+  block or list of expressions is read as Rust. Variables that the macro's own
+  syntax binds (the `r` in `r = ...`) are not known there, so they do not hide
+  an imported function.
+- **In a `macro_rules!` body, only a path ending in `sqlx::NAME` counts**, such
+  as `sqlx::query!(...)`, `::sqlx::query("...")` or
+  `$crate::db::sqlx::query!(...)`. A bare name or a crate alias is not
+  recognised there, because the paths in a macro body are resolved where the
+  macro is used, not where it is defined. The SQL must be a string literal
+  written in the body: `sqlx::query!($sql)` has no SQL to read.
 - **`SET` statements are skipped.** A query whose SQL starts with the word
   `SET` followed by a space (in any case, after any leading whitespace), such
   as `SET LOCAL app.user_id = ...`, is neither linted nor fixed.
@@ -371,9 +402,9 @@ the rules `fix` must keep.
 
 Note: apart from the imports a bare name needs, a query's location doesn't
 matter. A `sqlx::query!` or `sqlx::query("...")` inside a function body,
-`impl`, closure, or the arguments of another macro (such as `assert!`, `vec!`
-or `tokio::try_join!`, whenever those arguments parse as Rust expressions) is
-picked up just the same.
+`impl`, closure, `macro_rules!` body, or the arguments of another macro (such
+as `assert!`, `vec!`, `tokio::try_join!` or `tokio::select!`) is picked up just
+the same.
 
 ## License
 

@@ -9,7 +9,11 @@ before changing behaviour, and update them in the same change.
 - `crates/core` (`sqlx-sqruff-core`, library): finds SQL string literals in Rust
   source and lints or rewrites them.
   - `extract.rs`: finds `sqlx::query*!` macros and `sqlx::query*(...)` calls with
-    `syn`, with scope-aware handling of `use sqlx::...` imports and crate aliases.
+    `syn`, with scope-aware handling of `use sqlx::...` imports, crate aliases
+    and the local variables that hide an imported function. The tokens of
+    macros whose arguments are not Rust expressions, and of `macro_rules!`
+    bodies, are searched for `PATH!(...)` and `PATH(...)` with the same rules
+    (only paths ending in `sqlx::NAME` inside `macro_rules!`).
   - `literal.rs`: parses a literal's source text into its value, with the source
     offset of every character, and builds the `LintView` (the SQL given to
     sqruff) together with the mapping back to source positions.
