@@ -52,9 +52,20 @@ pub fn extract(src: &str) -> Vec<QueryLiteral> {
     extract_checked(src).unwrap_or_default()
 }
 
+/// Why a file is not valid Rust.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseError {
+    /// 1-based line in the file that `syn`'s error points at.
+    pub line: usize,
+    /// 1-based column in that line, counted in chars.
+    pub col: usize,
+    /// `syn`'s message.
+    pub message: String,
+}
+
 /// Like [`extract`], but returns the `syn` parse error so callers can report
 /// that a whole file was skipped (rather than hiding its queries).
-pub fn extract_checked(src: &str) -> Result<Vec<QueryLiteral>, String> {
+pub fn extract_checked(src: &str) -> Result<Vec<QueryLiteral>, ParseError> {
     // Cheap byte-substring gate before the expensive `syn::parse_file`: every
     // supported macro and function name (`query`, `query_as`, ...) contains
     // "query", so a file without that substring has no inline SQL and need not
@@ -65,7 +76,19 @@ pub fn extract_checked(src: &str) -> Result<Vec<QueryLiteral>, String> {
     if !src.contains("query") {
         return Ok(Vec::new());
     }
-    let file = syn::parse_file(src).map_err(|e| e.to_string())?;
+    let file = syn::parse_file(src).map_err(|e| {
+        // An error at the end of the file has no token to point at, so its span
+        // covers no source text and starts at line 1. Point after the last token.
+        let (line, col) = if e.span().source_text().is_none() {
+            let text = src.trim_end();
+            let last_line = text.rsplit('\n').next().unwrap_or_default();
+            (text.matches('\n').count() + 1, last_line.chars().count() + 1)
+        } else {
+            let start = e.span().start();
+            (start.line, start.column + 1)
+        };
+        ParseError { line, col, message: e.to_string() }
+    })?;
     let mut v = Visitor::default();
     v.visit_file(&file);
 
@@ -1238,5 +1261,22 @@ fn f() {
         // Contains "query" -> syn must still run, so a genuine parse failure is
         // surfaced (the CLI reports it as an error naming the file).
         assert!(extract_checked("query! this is not rust {{{").is_err());
+    }
+
+    fn error_position(src: &str) -> (usize, usize) {
+        let err = extract_checked(src).unwrap_err();
+        (err.line, err.col)
+    }
+
+    #[test]
+    fn a_parse_error_gives_the_line_and_column_that_syn_points_at() {
+        assert_eq!(error_position("fn f() {\n    let x = ;\n    sqlx::query(\"SELECT 1\");\n}\n"), (2, 13));
+        // Columns count chars, not bytes.
+        assert_eq!(error_position("fn f() {\n    let é = ;\n    sqlx::query(\"SELECT 1\");\n}\n"), (2, 13));
+        // A delimiter that is never closed.
+        assert_eq!(error_position("fn f() {\n    sqlx::query(\"SELECT 1\");\n"), (1, 8));
+        assert_eq!(error_position(")\nfn f() {\n    sqlx::query(\"SELECT 1\");\n}\n"), (1, 1));
+        // The end of the file.
+        assert_eq!(error_position("fn f() {\n    sqlx::query(\"SELECT 1\")\n}\nfn g() -> query\n\n"), (4, 16));
     }
 }

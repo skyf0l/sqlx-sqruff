@@ -24,7 +24,7 @@ use std::{
     process::ExitCode,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use config::CliSettings;
 use ignore::{WalkBuilder, overrides::OverrideBuilder};
@@ -45,18 +45,46 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Lint inline SQL; non-zero exit if any findings.
+    #[command(after_help = exit_status("  0  no findings\n  1  one or more findings"))]
     Check(CheckArgs),
-    /// Apply fixes and write back into .rs files.
+    /// Apply fixes and write them back into the scanned files.
+    #[command(after_help = exit_status(
+        "  0  without --check: no error, even when a change could not be applied (each\n     \
+         is reported on a `warning:` line); with --check: nothing to change\n  \
+         1  with --check: a file would change, or a needed change cannot be applied"
+    ))]
     Fix(FixArgs),
     /// Print every extracted query (debug).
+    #[command(after_help = exit_status("  0  no error"))]
     List(ListArgs),
     /// Print each query's SQL as the linter sees it (debug).
+    #[command(after_help = exit_status("  0  no error"))]
     Dump(ListArgs),
 }
+
+/// The exit status list of a command's help: `codes`, the command's own lines,
+/// then the `2` that every command shares.
+fn exit_status(codes: &str) -> String {
+    format!(
+        "Exit status:\n{codes}\n  \
+         2  an error, each reported on an `error:` line: a path that does not exist\n     \
+         or selects no file to scan, a file that cannot be read, parsed as Rust or\n     \
+         written, or an invalid config or argument"
+    )
+}
+
+const PATHS_HELP: &str = "Files and directories to scan (default: the current directory). A file \
+    named here is scanned whatever its extension; a directory is walked for .rs files. Naming \
+    paths replaces the [sqlx-sqruff] include patterns; exclude and the ignore files still prune \
+    what is found inside a named directory.";
+
+/// Where the README explains the rules whose fix can change what a query does.
+const RISKY_FIX_RULES_DOC: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "#fixes-that-can-change-a-query");
 
 // `list` and `dump` do not lint, so they take no `--dialect`.
 #[derive(Parser)]
 struct ListArgs {
+    #[arg(help = PATHS_HELP)]
     paths: Vec<PathBuf>,
     /// Extra sqruff config file. Only its `[sqlx-sqruff]` section is used here,
     /// to select the files.
@@ -79,6 +107,7 @@ struct ConfigOpts {
 
 #[derive(Parser)]
 struct CheckArgs {
+    #[arg(help = PATHS_HELP)]
     paths: Vec<PathBuf>,
     #[command(flatten)]
     cfg: ConfigOpts,
@@ -89,6 +118,7 @@ struct CheckArgs {
 
 #[derive(Parser)]
 struct FixArgs {
+    #[arg(help = PATHS_HELP)]
     paths: Vec<PathBuf>,
     #[command(flatten)]
     cfg: ConfigOpts,
@@ -144,12 +174,13 @@ impl Errors {
     }
 
     /// The queries in `src`, the text of `path`, or `None` after reporting that
-    /// it is not valid Rust.
+    /// it is not valid Rust, at the position of the error.
     fn extract(&mut self, path: &Path, src: &str) -> Option<Vec<QueryLiteral>> {
         extract_checked(src)
             .map_err(|e| {
-                let first = e.lines().next().unwrap_or("parse error");
-                self.report(path, format_args!("cannot parse as Rust: {first}"));
+                let first = e.message.lines().next().unwrap_or("parse error");
+                eprintln!("error: {}:{}:{}: cannot parse as Rust: {first}", shown(path).display(), e.line, e.col);
+                self.0 += 1;
             })
             .ok()
     }
@@ -199,7 +230,15 @@ fn cmd_dump(a: ListArgs) -> Result<ExitCode> {
 }
 
 fn engine(cfg: &ConfigOpts) -> Result<SqruffEngine> {
-    SqruffEngine::discover(cfg.dialect.as_deref(), cfg.config.as_deref()).map_err(anyhow::Error::msg)
+    let engine =
+        SqruffEngine::discover(cfg.dialect.as_deref(), cfg.config.as_deref()).map_err(anyhow::Error::msg)?;
+    if !engine.config_found() {
+        eprintln!(
+            "note: no sqruff config found: no config file sets a sqruff option, so sqruff's \
+             default rules apply"
+        );
+    }
+    Ok(engine)
 }
 
 fn cmd_check(a: CheckArgs) -> Result<ExitCode> {
@@ -229,7 +268,7 @@ fn cmd_check(a: CheckArgs) -> Result<ExitCode> {
             }
         }
     }
-    eprintln!("{total} finding(s); {failed_files} file(s) could not be checked.");
+    eprintln!("{total} finding(s); {failed_files} file(s) failed.");
     Ok(errors.exit_code(total > 0))
 }
 
@@ -238,6 +277,15 @@ fn cmd_fix(a: FixArgs) -> Result<ExitCode> {
         return Ok(ExitCode::from(2));
     }
     let engine = engine(&a.cfg)?;
+    let risky = engine.risky_fix_rules();
+    if !risky.is_empty() {
+        eprintln!(
+            "warning: the fixes of these enabled rules can change what a query does: {}; review \
+             the changes, or disable the rules for `fix` (see \"Fixes that can change a query\" \
+             in the README: {RISKY_FIX_RULES_DOC})",
+            risky.join(", ")
+        );
+    }
     let settings = CliSettings::load(a.cfg.config.as_deref())?;
     let mut errors = Errors::default();
     let mut changed_files = 0usize;
@@ -432,10 +480,11 @@ fn cmd_list(a: ListArgs) -> Result<ExitCode> {
 ///   `.` and `include` (when set) acts as a whitelist.
 /// - `exclude` and `.gitignore` (when `respect_gitignore`) prune what a walk
 ///   finds below its root, but never the root itself.
-/// - The globs are relative to `settings.base`, else to the walked directory.
+/// - The globs are relative to `settings.base()`, else to the walked directory.
 ///
-/// A directory that cannot be read is reported in `errors` and skipped. Finding
-/// no file at all is an error, so that a run that checks nothing cannot pass.
+/// A directory that cannot be read is reported in `errors` and skipped. A
+/// search root that selects no file is reported in `errors`, so that a run that
+/// misses a path it was given cannot pass.
 fn collect_files(
     paths: &[PathBuf],
     settings: &CliSettings,
@@ -464,8 +513,8 @@ fn collect_files(
             continue;
         }
         // The walk runs on the canonical root so that its paths share a prefix
-        // with `settings.base`, which the globs are matched relative to.
-        let base = settings.base.as_deref().unwrap_or(&canonical_root);
+        // with `settings.base()`, which the globs are matched relative to.
+        let base = settings.base().unwrap_or(&canonical_root);
         let overrides = build_overrides(base, settings, use_include)
             .with_context(|| format!("building file filters for {}", root.display()))?;
         let rg = settings.respect_gitignore;
@@ -479,25 +528,36 @@ fn collect_files(
             .parents(rg)
             .require_git(false)
             .sort_by_file_name(|a, b| a.cmp(b));
+        // Counts the files that another root already selected too, so that
+        // naming a directory twice is not an error.
+        let mut selected = 0usize;
         for entry in builder.build() {
             match entry {
                 Ok(entry) => {
                     let p = entry.path();
-                    if entry.file_type().is_some_and(|t| t.is_file())
-                        && is_rs(p)
-                        && seen.insert(p.to_path_buf())
-                    {
-                        out.push(shown(&under_root(root, &canonical_root, p)));
+                    if entry.file_type().is_some_and(|t| t.is_file()) && is_rs(p) {
+                        selected += 1;
+                        if seen.insert(p.to_path_buf()) {
+                            out.push(shown(&under_root(root, &canonical_root, p)));
+                        }
                     }
                 }
                 Err(err) => report_walk_error(root, &canonical_root, &err, errors),
             }
         }
-    }
-    if out.is_empty() {
-        let searched: Vec<String> = roots.iter().map(|root| shown(root).display().to_string()).collect();
-        let what = if use_include { "Rust files matching the [sqlx-sqruff] include patterns" } else { "Rust files" };
-        bail!("no {what} found in {}", searched.join(", "));
+        if selected == 0 {
+            match settings.file.as_deref().filter(|_| use_include) {
+                Some(config) => errors.report(
+                    config,
+                    format_args!(
+                        "no Rust files match the [sqlx-sqruff] include patterns, which are \
+                         relative to {}",
+                        shown(base).display()
+                    ),
+                ),
+                None => errors.report(root, "no Rust files found"),
+            }
+        }
     }
     out.sort();
     Ok(out)

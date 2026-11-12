@@ -101,7 +101,7 @@ Before changing any of these, run the tool on a copy of a real sqlx codebase
   config-loading calls inside it.
 - The CLI's dialect order is: `--dialect`, then the config's `dialect`, then
   `postgres`. Dialect names are validated with sqruff's own `DialectKind`.
-- sqruff gives parse errors, unreadable `-- noqa` comments and failed rules the
+- sqruff gives parse errors, malformed `-- noqa` comments and failed rules the
   same code, so `code()` in `sqruff_adapter.rs` tells them apart by the start of
   sqruff's messages. Re-check those messages when upgrading sqruff. An
   unrecognised message falls back to `PARSE`, which blocks `fix`.

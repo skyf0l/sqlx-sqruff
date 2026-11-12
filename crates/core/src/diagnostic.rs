@@ -5,8 +5,11 @@
 pub const PARSE: &str = "PARSE";
 /// Code of a finding where sqruff could not split the SQL into tokens.
 pub const LEX: &str = "LEX";
-/// Code of a finding on a `-- noqa` comment that sqruff cannot read, or that
-/// silences nothing when sqruff's `warn_unused_ignores` is set.
+/// Code of a finding on a `-- noqa` comment that sqruff reports as malformed
+/// (`noqa` followed by something other than `:`, or `noqa:` followed by
+/// nothing), or, when sqruff's `warn_unused_ignores` is set, on one that
+/// silences nothing. sqruff accepts a comment that names no rule it knows, such
+/// as `-- noqa:disable` or `-- noqa: foo=CP01`, without a finding of its own.
 pub const NOQA: &str = "NOQA";
 /// Code of a finding where sqruff failed on the query, for example on an
 /// invalid inline `-- sqruff:` config line, or a rule failed inside sqruff.

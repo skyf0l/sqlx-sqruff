@@ -110,7 +110,7 @@ fn fix_check_shows_each_query_before_and_after() {
 fn list_and_dump_report_a_file_that_does_not_parse_as_an_error() {
     let src = "fn f() {\n    let _ = sqlx::query!(\"SELECT 1\");\n";
     let p = Project::new("unparsable", CV05, src);
-    let file = format!("error: {FILE}: ");
+    let file = format!("error: {FILE}:");
     for command in ["list", "dump"] {
         let out = p.run(&[command]);
         assert_eq!(out.status.code(), Some(2), "{command}: {}", stderr(&out));
@@ -323,6 +323,74 @@ fn a_missing_config_file_is_an_error_not_a_crash() {
     let out = p.command().arg("check").arg(&p.file).arg("--config").arg(&missing).output().unwrap();
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
     assert!(stderr(&out).contains(&missing.display().to_string()), "{}", stderr(&out));
+}
+
+/// A query that none of the rules in the tests below would change.
+const CLEAN: &str = "fn f() {\n    let _ = sqlx::query!(\"SELECT a FROM t\");\n}\n";
+
+fn warnings(out: &Output) -> Vec<String> {
+    stderr(out).lines().filter(|l| l.starts_with("warning:")).map(str::to_string).collect()
+}
+
+#[test]
+fn fix_warns_once_about_the_enabled_rules_whose_fix_can_change_a_query() {
+    let p = Project::new("risky_rules", "[sqruff]\ndialect = postgres\nrules = CV05,ST06,RF03\n", CLEAN);
+    for args in [&["fix", "--check"][..], &["fix"]] {
+        let out = p.run(args);
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {}", stderr(&out));
+        let warnings = warnings(&out);
+        assert_eq!(warnings.len(), 1, "{args:?}: {}", stderr(&out));
+        assert!(warnings[0].contains("ST06") && warnings[0].contains("RF03"), "{args:?}: {}", stderr(&out));
+        assert!(!warnings[0].contains("CV05"), "{args:?}: {}", stderr(&out));
+        assert!(warnings[0].contains("README"), "{args:?}: {}", stderr(&out));
+    }
+    let check = p.run(&["check"]);
+    assert_eq!(check.status.code(), Some(0), "{}", stderr(&check));
+    assert!(warnings(&check).is_empty(), "{}", stderr(&check));
+}
+
+#[test]
+fn fix_warns_about_am02_and_cp02_only_with_the_dialects_where_their_fix_can_change_a_query() {
+    for (dialect, rules, warned) in [
+        ("postgres", "CV05,AM02,CP02", None),
+        ("sqlite", "CV05,AM02", Some("AM02")),
+        ("mysql", "CV05,CP02", Some("CP02")),
+        ("mariadb", "CV05,CP02", Some("CP02")),
+    ] {
+        let config = format!("[sqruff]\ndialect = {dialect}\nrules = {rules}\n");
+        let p = Project::new(&format!("risky_{dialect}"), &config, CLEAN);
+        let out = p.run(&["fix", "--check"]);
+        assert_eq!(out.status.code(), Some(0), "{dialect}: {}", stderr(&out));
+        let warnings = warnings(&out);
+        match warned {
+            None => assert!(warnings.is_empty(), "{dialect}: {}", stderr(&out)),
+            Some(rule) => {
+                assert_eq!(warnings.len(), 1, "{dialect}: {}", stderr(&out));
+                assert!(warnings[0].contains(rule), "{dialect}: {}", stderr(&out));
+            }
+        }
+    }
+}
+
+#[test]
+fn every_command_help_describes_the_paths_and_lists_its_exit_codes() {
+    let p = Project::new("help", CV05, CLEAN);
+    for (command, codes) in [("check", &["0", "1", "2"][..]), ("fix", &["0", "1", "2"]), ("list", &["0", "2"]), ("dump", &["0", "2"])] {
+        let out = p.command().args([command, "--help"]).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{command}: {}", stderr(&out));
+        let help = String::from_utf8_lossy(&out.stdout).into_owned();
+        let arguments: String = help
+            .lines()
+            .skip_while(|l| !l.starts_with("Arguments:"))
+            .skip(1)
+            .take_while(|l| !l.starts_with("Options:"))
+            .collect();
+        let description = arguments.replace("[PATHS]...", "");
+        assert!(!description.trim().is_empty(), "{command}: {help}");
+        for code in codes {
+            assert!(help.lines().any(|l| l.split_whitespace().next() == Some(code)), "{command} {code}: {help}");
+        }
+    }
 }
 
 #[test]

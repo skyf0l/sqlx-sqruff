@@ -81,7 +81,7 @@ impl Finding {
 }
 
 /// The code of a sqruff finding. sqruff reports lexing errors as `LXR` and
-/// every other finding without a rule as `????`: parse errors, unreadable
+/// every other finding without a rule as `????`: parse errors, malformed
 /// `-- noqa` comments and rules that failed. Those are told apart by the
 /// messages sqruff gives them.
 fn code(e: &SQLBaseError) -> &'static str {
@@ -94,8 +94,21 @@ fn code(e: &SQLBaseError) -> &'static str {
     }
 }
 
+/// The rules whose fix can change what a query does, each with the dialects
+/// on which it can, or none for every dialect that sqruff runs the rule on.
+/// The README's "Fixes that can change a query" section explains each one.
+const RISKY_FIX_RULES: &[(&str, &[DialectKind])] = &[
+    ("AM02", &[]),
+    ("CP02", &[DialectKind::Mysql, DialectKind::Mariadb]),
+    ("RF03", &[]),
+    ("ST06", &[]),
+    ("ST07", &[]),
+];
+
 pub struct SqruffEngine {
     linter: Linter,
+    config_found: bool,
+    risky_fix_rules: Vec<&'static str>,
 }
 
 impl SqruffEngine {
@@ -114,16 +127,20 @@ impl SqruffEngine {
                     .ok_or_else(|| format!("config path {} is not valid UTF-8", path.display()))
             })
             .transpose()?;
+        let has_extra_config = extra_config.is_some();
         let raw = ConfigLoader
             .try_load_config_up_to_path(Path::new("."), extra_config, false)
             .map_err(|e| e.to_string())?;
+        // sqruff keeps only its own sections, so `raw` is empty both when no
+        // config file exists and when the files hold no sqruff option.
+        let config_found = has_extra_config || !raw.is_empty();
         let configured = configured_dialect(raw.get("core"))?;
         let dialect = match (dialect, configured) {
             (Some(name), _) => Some(parse_dialect(name)?),
             (None, None) => Some(DialectKind::Postgres),
             (None, Some(_)) => None,
         };
-        Self::build(raw, dialect)
+        Self::build(raw, dialect, config_found)
     }
 
     /// Build from an explicit config string (tests, or callers that hold their
@@ -131,12 +148,12 @@ impl SqruffEngine {
     pub fn from_source(config_src: &str) -> Result<Self, String> {
         let raw = ConfigLoader::try_from_source(config_src, None).map_err(|e| e.to_string())?;
         configured_dialect(raw.get("core"))?;
-        Self::build(raw, None)
+        Self::build(raw, None, true)
     }
 
     /// `raw` must hold no dialect name that `DialectKind` rejects, because
     /// sqruff panics on one while building the config.
-    fn build(raw: ConfigMap, dialect: Option<DialectKind>) -> Result<Self, String> {
+    fn build(raw: ConfigMap, dialect: Option<DialectKind>, config_found: bool) -> Result<Self, String> {
         let linter = without_panicking(move || {
             let mut config = FluffConfig::new(raw, None, None);
             if let Some(kind) = dialect {
@@ -147,7 +164,32 @@ impl SqruffEngine {
         // A config-level problem such as an unknown rule code makes every lint
         // fail, so report it once here instead of once per query.
         linter.lint_string("SELECT 1\n", None, false).map_err(|e| e.to_string())?;
-        Ok(Self { linter })
+        let kind = linter.config().dialect_kind();
+        let risky_fix_rules = linter
+            .rules()
+            .map_err(|e| e.to_string())?
+            .iter()
+            .filter(|rule| rule.force_enable() || !rule.dialect_skip().contains(&kind))
+            .filter_map(|rule| {
+                RISKY_FIX_RULES
+                    .iter()
+                    .find(|(code, dialects)| *code == rule.code() && (dialects.is_empty() || dialects.contains(&kind)))
+                    .map(|(code, _)| *code)
+            })
+            .collect();
+        Ok(Self { linter, config_found, risky_fix_rules })
+    }
+
+    /// Whether `--config` was given or a discovered config file sets a sqruff
+    /// option. When `false`, sqruff's default rules apply.
+    pub fn config_found(&self) -> bool {
+        self.config_found
+    }
+
+    /// The enabled rules whose fix can change what a query does with the
+    /// configured dialect.
+    pub fn risky_fix_rules(&self) -> &[&'static str] {
+        &self.risky_fix_rules
     }
 
     /// Lint only. `Err` carries sqruff's message when it cannot process `sql`
@@ -292,6 +334,24 @@ mod tests {
         let finding = Finding::from(&failed);
         assert_eq!(finding.code, INTERNAL);
         assert!(finding.unparsable);
+    }
+
+    #[test]
+    fn the_risky_fix_rules_are_the_enabled_ones_that_sqruff_runs_with_the_dialect() {
+        let all = "AM02,CP02,CV05,RF03,ST06,ST07";
+        for (dialect, rules, expected) in [
+            ("postgres", "CV05", &[][..]),
+            ("postgres", all, &["RF03", "ST06", "ST07"]),
+            ("mysql", all, &["AM02", "CP02", "RF03", "ST06", "ST07"]),
+            // sqruff skips ST07 on clickhouse.
+            ("clickhouse", "ST07", &[]),
+        ] {
+            let config = format!("[sqruff]\ndialect = {dialect}\nrules = {rules}\n");
+            let engine = SqruffEngine::from_source(&config).unwrap();
+            assert_eq!(engine.risky_fix_rules(), expected, "{config:?}");
+        }
+        let excluded = "[sqruff]\ndialect = sqlite\nrules = AM02,ST06\nexclude_rules = ST06\n";
+        assert_eq!(SqruffEngine::from_source(excluded).unwrap().risky_fix_rules(), ["AM02"]);
     }
 
     #[test]
