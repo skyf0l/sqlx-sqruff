@@ -572,6 +572,7 @@ mod tests {
             "fn f() {\n    let _ = sqlx::query!(r#\"SELECT a AS \"a!\"\n        FROM t\n          WHERE x = NULL\"#);\n}\n",
             "fn f() {\n    let _ = sqlx::query(\"SELECT \\\"a\\\"  FROM t WHERE x = NULL\");\n}\n",
             "fn f() {\n    let _ = sqlx::query(\n        \"SELECT \\\"a\\\"\n         FROM t\n         WHERE x = NULL\",\n    );\n}\n",
+            "fn f() {\n    let _ = sqlx::query!(\n        r#\"\n        insert into notes (body) values ('a\n        \n   \n  \n          \n        b'),  ('x')\n        \"#\n    );\n}\n",
         ];
         let eng = layout_engine();
         for src in fixtures {
@@ -591,6 +592,17 @@ mod tests {
                 assert!(fixable.is_empty(), "{fixable:?} left in:\n{fixed}");
             }
         }
+    }
+
+    #[test]
+    fn a_query_split_into_literals_joined_with_plus_is_neither_checked_nor_fixed() {
+        let src = "fn f() {\n    let _ = sqlx::query!(\"SELECT  id \" + \"FROM users WHERE id = $1\", 1);\n    let _ = sqlx::query_as!(Row, r#\"\n        select  a\n    \"# + \"from t where x = null\");\n}\n";
+        let eng = layout_engine();
+        let diags = check_file("f.rs", src, &eng);
+        assert!(diags.is_empty(), "{diags:?}");
+        let out = fix_file("f.rs", src, &eng).unwrap();
+        assert_eq!(out.new_src, None);
+        assert!(out.changes.is_empty() && out.layout_kept_lines.is_empty() && out.unparsable_lines.is_empty());
     }
 
     #[test]
@@ -668,6 +680,35 @@ mod tests {
         ] {
             assert!(fixed.contains(constant), "{constant:?} changed in:\n{fixed}");
         }
+        assert_eq!(fixed.replace("x IS NULL", "x = NULL"), src);
+    }
+
+    #[test]
+    fn a_fix_keeps_whitespace_only_lines_shorter_equal_or_longer_than_the_indent() {
+        let src = concat!(
+            "fn f() {\n",
+            "    let _ = sqlx::query!(\n",
+            "        r#\"\n",
+            "        INSERT INTO notes (body) SELECT 'first\n",
+            "        \n",
+            "   \n",
+            "  \n",
+            "          \n",
+            "\n",
+            "        second' FROM t WHERE x = NULL\n",
+            "        \"#\n",
+            "    );\n",
+            "    let _ = sqlx::query!(\"SELECT 'p\n",
+            "        \n",
+            "   \n",
+            "  \n",
+            "          \n",
+            "        q' AS c\n",
+            "        FROM t WHERE x = NULL\");\n",
+            "}\n",
+        );
+        let fixed = fix_file("f.rs", src, &cv05_engine()).unwrap().new_src.expect("should change");
+        assert_eq!(fixed.matches("x IS NULL").count(), 2, "{fixed}");
         assert_eq!(fixed.replace("x IS NULL", "x = NULL"), src);
     }
 
