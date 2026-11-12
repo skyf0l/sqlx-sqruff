@@ -64,6 +64,11 @@ Shared flags on `check` / `fix`:
 - `--dialect NAME`: SQL dialect, overriding the config's `dialect` (see
   [Config resolution](#config-resolution)).
 
+`list` and `dump` do not lint, so they take only `--config`, and only for the
+file selection in its `[sqlx-sqruff]` section (see
+[Selecting which files to scan](#selecting-which-files-to-scan)). Passing
+`--dialect` to them is an argument error (exit `2`).
+
 With `--check`, `fix` prints each query it would change: its `path:line`, the
 current literal with every line prefixed by `- `, then the fixed literal with
 every line prefixed by `+ `.
@@ -80,12 +85,21 @@ Exit codes:
 - Every command exits `2` on errors:
   - a path given on the command line that does not exist. This is checked
     before any work, and each missing path is named.
-  - a `.rs` file or directory that cannot be read (for example a file that is
-    not UTF-8), or a fixed file that cannot be written. Each such path is
-    named, the run goes on with the other files and still prints its summary,
-    and the exit code is `2` at the end.
+  - no file to scan: the paths you name, or the current directory, hold no
+    `.rs` file that the [file selection](#selecting-which-files-to-scan)
+    keeps, for example an empty directory or an `include` that matches
+    nothing. The error names the paths searched, so a CI step cannot pass
+    while checking nothing.
+  - a file or directory that cannot be read (for example a file that is not
+    UTF-8), a file that is not valid Rust (see *Unparsable Rust is an error for
+    the whole file* under [Known limitations](#known-limitations)), or a fixed
+    file that cannot be
+    written. Each such path is named on an `error: <path>: ...` line, the run
+    goes on with the other files and still prints its summary, and the exit
+    code is `2` at the end.
   - an invalid config, such as an unknown dialect, a `--config` file that
     cannot be read, or an invalid value in the `[sqlx-sqruff]` section.
+  - an invalid argument, such as an unknown flag.
 
 `fix` cleans every query in place and **preserves each literal's line-shape**:
 one-liners stay on one line, multi-line raw blocks keep block layout. Line-shape
@@ -96,9 +110,10 @@ keep it on one line.
 `fix` leaves a query unchanged, warns about it, and counts it as not applied
 (so `fix --check` fails) when:
 
-- sqruff cannot fully parse its SQL with the configured dialect, because a fix
-  computed from a partial parse may change what the query does. Check the
-  dialect, or the SQL.
+- sqruff cannot fully parse its SQL with the configured dialect, or one of
+  sqruff's rules failed on it (an `INTERNAL` finding), because a fix computed
+  from a partial parse may change what the query does. Check the dialect, or
+  the SQL.
 - sqruff's fix needs a different line layout than the literal has, for example
   a line break inside a one-line literal. Write the query as a multi-line raw
   string (`r#"`...`"#`), or disable the rule.
@@ -200,6 +215,19 @@ starting with `.`) are skipped, and symbolic links found while walking are not
 followed; a path you name on the command line is always followed. Each file is
 scanned once, even when two of the paths you name contain it.
 
+The ignore files, `exclude` and the hidden-name rule prune only what the walk
+finds inside a search root, never the root itself:
+
+- A **file** you name is always scanned, whatever its extension (so
+  `sqlx-sqruff check build/queries.txt` works), even when it is ignored or
+  excluded.
+- A **directory** you name is walked even when it is ignored, excluded or
+  hidden. With `gen/` in `.gitignore`, `sqlx-sqruff check` and
+  `sqlx-sqruff check .` skip `gen/`, but `sqlx-sqruff check gen` scans it, as
+  does a run started inside `gen/`. A pattern that matches the files or
+  directories inside it, such as `gen/**` or `*.gen.rs`, still prunes them.
+- Files found by walking a directory are scanned only when they end in `.rs`.
+
 To persist a project's scope, add a **`[sqlx-sqruff]`** section to your
 `.sqruff`. sqruff itself ignores this section (it only reads `sqruff` /
 `sqruff:*`), so it is consumed solely by this CLI:
@@ -254,7 +282,8 @@ Selection rules:
 
 - **Explicit positional paths win.** `sqlx-sqruff check src/foo` scans `src/foo`
   and ignores `include` (you've named your own scope); `exclude` and
-  `.gitignore` still prune. A directly-named **file** is always scanned.
+  `.gitignore` still prune what is found inside it, as described above. A
+  directly-named **file** is always scanned.
 - Globs are gitignore-style (`**` spans directories), matched relative to the
   directory of the config file that defines them, whatever the current
   directory and the paths you name. With `exclude = src/generated/**`,
@@ -328,8 +357,12 @@ the rules `fix` must keep.
   of a SQL string value. A whitespace-only line outside a string value, such as
   an indented blank line between two clauses, is therefore reported by `LT01`
   as trailing whitespace, and `fix` empties it.
-- **Whole-file skip on unparsable Rust.** If `syn` can't parse a file, it is
-  skipped with a warning (never silently), and no queries from it are linted.
+- **Unparsable Rust is an error for the whole file.** If `syn` cannot parse a
+  file, none of its queries are read. Every command reports the file on an
+  `error: <path>: cannot parse as Rust: ...` line, goes on with the other
+  files, and exits `2`. A file that does not contain the text `query` is not
+  parsed at all, because it cannot hold a query, so it is never reported, even
+  when it is not valid Rust.
 
 Note: apart from the imports a bare name needs, a query's location doesn't
 matter. A `sqlx::query!` or `sqlx::query("...")` inside a function body,

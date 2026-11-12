@@ -29,8 +29,12 @@ impl Project {
     }
 
     fn check(&self, args: &[&str]) -> Output {
+        self.run("check", args)
+    }
+
+    fn run(&self, command: &str, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_sqlx-sqruff"))
-            .arg("check")
+            .arg(command)
             .arg("q.rs")
             .args(args)
             .current_dir(&self.0)
@@ -90,6 +94,21 @@ fn an_unknown_dialect_flag_is_an_error_naming_it() {
     let out = p.check(&["--dialect", "mysqll"]);
     assert_eq!(out.status.code(), Some(2), "{}", report(&out));
     assert!(String::from_utf8_lossy(&out.stderr).contains("mysqll"), "{}", report(&out));
+}
+
+#[test]
+fn list_and_dump_reject_the_dialect_flag_they_would_not_use() {
+    let p = Project::new("list_dump_flag", Some("[sqruff]\nrules = CV05\n"), POSTGRES_QUERY);
+    for command in ["list", "dump"] {
+        for dialect in ["postgres", "bogus"] {
+            let out = p.run(command, &["--dialect", dialect]);
+            assert_eq!(out.status.code(), Some(2), "{command} {dialect}: {}", report(&out));
+            assert!(out.stdout.is_empty(), "{command} {dialect}: {}", report(&out));
+            assert!(String::from_utf8_lossy(&out.stderr).contains("--dialect"), "{command} {dialect}: {}", report(&out));
+        }
+        let out = p.run(command, &[]);
+        assert_eq!(out.status.code(), Some(0), "{command}: {}", report(&out));
+    }
 }
 
 #[test]

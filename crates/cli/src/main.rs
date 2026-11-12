@@ -24,14 +24,14 @@ use std::{
     process::ExitCode,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use config::CliSettings;
 use ignore::{WalkBuilder, overrides::OverrideBuilder};
 use paths::shown;
 use sqlx_sqruff_core::{
     engine::{QueryChange, check_extracted, dump_extracted, fix_extracted},
-    extract::extract_checked,
+    extract::{QueryLiteral, extract_checked},
     sqruff_adapter::SqruffEngine,
 };
 
@@ -52,6 +52,16 @@ enum Command {
     List(ListArgs),
     /// Print each query's SQL as the linter sees it (debug).
     Dump(ListArgs),
+}
+
+// `list` and `dump` do not lint, so they take no `--dialect`.
+#[derive(Parser)]
+struct ListArgs {
+    paths: Vec<PathBuf>,
+    /// Extra sqruff config file. Only its `[sqlx-sqruff]` section is used here,
+    /// to select the files.
+    #[arg(long)]
+    config: Option<PathBuf>,
 }
 
 /// Shared config flags (mirror sqruff): explicit config file + dialect default.
@@ -86,13 +96,6 @@ struct FixArgs {
     /// cannot be applied.
     #[arg(long)]
     check: bool,
-}
-
-#[derive(Parser)]
-struct ListArgs {
-    paths: Vec<PathBuf>,
-    #[command(flatten)]
-    cfg: ConfigOpts,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -140,6 +143,17 @@ impl Errors {
         fs::read_to_string(path).map_err(|e| self.report(path, e)).ok()
     }
 
+    /// The queries in `src`, the text of `path`, or `None` after reporting that
+    /// it is not valid Rust.
+    fn extract(&mut self, path: &Path, src: &str) -> Option<Vec<QueryLiteral>> {
+        extract_checked(src)
+            .map_err(|e| {
+                let first = e.lines().next().unwrap_or("parse error");
+                self.report(path, format_args!("cannot parse as Rust: {first}"));
+            })
+            .ok()
+    }
+
     /// `2` after any error, else `1` when `failed`, else `0`.
     fn exit_code(&self, failed: bool) -> ExitCode {
         if self.0 > 0 {
@@ -172,17 +186,11 @@ fn cmd_dump(a: ListArgs) -> Result<ExitCode> {
     if !all_paths_exist(&a.paths) {
         return Ok(ExitCode::from(2));
     }
-    let settings = CliSettings::load(a.cfg.config.as_deref())?;
+    let settings = CliSettings::load(a.config.as_deref())?;
     let mut errors = Errors::default();
     for path in collect_files(&a.paths, &settings, &mut errors)? {
         let Some(src) = errors.read(&path) else { continue };
-        let queries = match extract_checked(&src) {
-            Ok(q) => q,
-            Err(e) => {
-                warn_skip(&path.display().to_string(), &e);
-                continue;
-            }
-        };
+        let Some(queries) = errors.extract(&path, &src) else { continue };
         for (line, sql) in dump_extracted(&queries) {
             println!("----- {}:{} -----\n{sql}", path.display(), line);
         }
@@ -202,20 +210,17 @@ fn cmd_check(a: CheckArgs) -> Result<ExitCode> {
     let settings = CliSettings::load(a.cfg.config.as_deref())?;
     let mut errors = Errors::default();
     let mut total = 0usize;
-    let mut skipped = 0usize;
+    let mut failed_files = 0usize;
     for path in collect_files(&a.paths, &settings, &mut errors)? {
-        let Some(src) = errors.read(&path) else { continue };
-        let p = path.display().to_string();
-        // Parse once: extract_checked both surfaces the syn error (for the skip
-        // warning) and yields the queries check_extracted needs, with no reparse.
-        let queries = match extract_checked(&src) {
-            Ok(q) => q,
-            Err(e) => {
-                warn_skip(&p, &e);
-                skipped += 1;
-                continue;
-            }
+        let Some(src) = errors.read(&path) else {
+            failed_files += 1;
+            continue;
         };
+        let Some(queries) = errors.extract(&path, &src) else {
+            failed_files += 1;
+            continue;
+        };
+        let p = path.display().to_string();
         for d in check_extracted(&p, &src, &queries, &engine) {
             total += 1;
             match a.format {
@@ -224,15 +229,8 @@ fn cmd_check(a: CheckArgs) -> Result<ExitCode> {
             }
         }
     }
-    eprintln!("{total} finding(s); {skipped} file(s) skipped (unparsable Rust).");
+    eprintln!("{total} finding(s); {failed_files} file(s) could not be checked.");
     Ok(errors.exit_code(total > 0))
-}
-
-/// Warn when a file can't be parsed by `syn`, so whole-file skips are visible,
-/// never silent. `err` is the `extract_checked` parse error.
-fn warn_skip(path: &str, err: &str) {
-    let first = err.lines().next().unwrap_or("parse error");
-    eprintln!("warning: skipping {path} (unparsable by syn): {first}");
 }
 
 fn cmd_fix(a: FixArgs) -> Result<ExitCode> {
@@ -246,23 +244,16 @@ fn cmd_fix(a: FixArgs) -> Result<ExitCode> {
     let mut changed_queries = 0usize;
     let mut not_applied = 0usize;
     let mut failed_files = 0usize;
-    let mut skipped = 0usize;
     for path in collect_files(&a.paths, &settings, &mut errors)? {
         let Some(src) = errors.read(&path) else {
             failed_files += 1;
             continue;
         };
-        let p = path.display().to_string();
-        // Parse once (see cmd_check): extract_checked feeds both the skip warning
-        // and fix_extracted.
-        let queries = match extract_checked(&src) {
-            Ok(q) => q,
-            Err(e) => {
-                warn_skip(&p, &e);
-                skipped += 1;
-                continue;
-            }
+        let Some(queries) = errors.extract(&path, &src) else {
+            failed_files += 1;
+            continue;
         };
+        let p = path.display().to_string();
         match fix_extracted(&p, &src, &queries, &engine) {
             Ok(out) => {
                 let mut warnings: Vec<(usize, String)> = Vec::new();
@@ -314,8 +305,8 @@ fn cmd_fix(a: FixArgs) -> Result<ExitCode> {
                     warnings.push((
                         *line,
                         "fix not applied: sqruff could not fully parse this SQL with the \
-                         configured dialect, so its fix may change the query; check the dialect \
-                         or the SQL"
+                         configured dialect, or one of its rules failed on it, so its fix may \
+                         change the query; check the dialect or the SQL"
                             .to_string(),
                     ));
                 }
@@ -358,7 +349,7 @@ fn cmd_fix(a: FixArgs) -> Result<ExitCode> {
     }
     eprintln!(
         "{changed_queries} query(ies) in {changed_files} file(s); {not_applied} not applied; \
-         {failed_files} file(s) failed; {skipped} file(s) skipped (unparsable Rust)."
+         {failed_files} file(s) failed."
     );
     let needs_change = a.check && (changed_files > 0 || not_applied > 0 || failed_files > 0);
     Ok(errors.exit_code(needs_change))
@@ -419,17 +410,11 @@ fn cmd_list(a: ListArgs) -> Result<ExitCode> {
     if !all_paths_exist(&a.paths) {
         return Ok(ExitCode::from(2));
     }
-    let settings = CliSettings::load(a.cfg.config.as_deref())?;
+    let settings = CliSettings::load(a.config.as_deref())?;
     let mut errors = Errors::default();
     for path in collect_files(&a.paths, &settings, &mut errors)? {
         let Some(src) = errors.read(&path) else { continue };
-        let queries = match extract_checked(&src) {
-            Ok(q) => q,
-            Err(e) => {
-                warn_skip(&path.display().to_string(), &e);
-                continue;
-            }
-        };
+        let Some(queries) = errors.extract(&path, &src) else { continue };
         for q in queries {
             println!("{}:{}", path.display(), q.line);
         }
@@ -437,18 +422,20 @@ fn cmd_list(a: ListArgs) -> Result<ExitCode> {
     Ok(errors.exit_code(false))
 }
 
-/// Discover the `.rs` files to scan, each once, sorted by path and spelled as
+/// Discover the files to scan, each once, sorted by path and spelled as
 /// [`shown`] prints them.
 ///
-/// - A directly-named **file** path is always processed (if it ends in `.rs`),
-///   bypassing include/exclude — naming a file means you want it scanned.
-/// - With **no** positional paths, the walk roots at `.` and `include` (when
-///   set) acts as a whitelist; otherwise every `.rs` file is taken.
-/// - `exclude` and `.gitignore` (when `respect_gitignore`) always prune, for
-///   both explicit directory paths and the default walk.
+/// - A directly-named **file** path is always processed, whatever its
+///   extension, bypassing include/exclude and the ignore files — naming a file
+///   means you want it scanned.
+/// - A walk takes only `.rs` files. With **no** positional paths, it roots at
+///   `.` and `include` (when set) acts as a whitelist.
+/// - `exclude` and `.gitignore` (when `respect_gitignore`) prune what a walk
+///   finds below its root, but never the root itself.
 /// - The globs are relative to `settings.base`, else to the walked directory.
 ///
-/// A directory that cannot be read is reported in `errors` and skipped.
+/// A directory that cannot be read is reported in `errors` and skipped. Finding
+/// no file at all is an error, so that a run that checks nothing cannot pass.
 fn collect_files(
     paths: &[PathBuf],
     settings: &CliSettings,
@@ -471,7 +458,7 @@ fn collect_files(
             }
         };
         if canonical_root.is_file() {
-            if is_rs(root) && seen.insert(canonical_root) {
+            if seen.insert(canonical_root) {
                 out.push(shown(root));
             }
             continue;
@@ -506,6 +493,11 @@ fn collect_files(
                 Err(err) => report_walk_error(root, &canonical_root, &err, errors),
             }
         }
+    }
+    if out.is_empty() {
+        let searched: Vec<String> = roots.iter().map(|root| shown(root).display().to_string()).collect();
+        let what = if use_include { "Rust files matching the [sqlx-sqruff] include patterns" } else { "Rust files" };
+        bail!("no {what} found in {}", searched.join(", "));
     }
     out.sort();
     Ok(out)
