@@ -73,6 +73,8 @@ covered by tests:
   - sqruff's change needs a different line layout (one-line literals stay on one
     line);
   - the rebuilt literal fails the value check;
+  - sqruff cannot fully parse the rebuilt literal's SQL, or one of its rules
+    fails on it (a `PARSE`, `LEX` or `INTERNAL` finding in `recheck`);
   - fixing the rebuilt literal again would change it further.
 - `check` and `fix` must agree: after `fix`, `check` must not report a finding
   that `fix` could have applied, and a second `fix` must change nothing. Add new

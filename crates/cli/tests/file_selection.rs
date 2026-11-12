@@ -133,6 +133,38 @@ fn an_unreadable_directory_is_reported_and_the_walk_continues() {
     assert!(stdout.lines().any(|l| l.contains("a.rs:")), "{}", report(&out));
 }
 
+#[cfg(unix)]
+#[test]
+fn a_named_directory_that_cannot_be_read_is_one_error_in_the_spelling_it_was_named() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let p = Project::new(
+        "unreadable_root",
+        &[(".sqruff", "[sqruff]\ndialect = postgres\nrules = CV05\n"), ("a.rs", CV05_QUERY), ("locked/b.rs", QUERY)],
+    );
+    let locked = p.path("locked");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let outs: Vec<_> = [&["list"][..], &["check"]]
+        .into_iter()
+        .map(|command| {
+            let mut args = command.to_vec();
+            args.extend(["locked", "a.rs"]);
+            (command, p.run("", &args))
+        })
+        .collect();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+    for (command, out) in &outs {
+        assert_eq!(out.status.code(), Some(2), "{command:?}: {}", report(out));
+        let errors = stderr_lines(out, "error:", &[]);
+        assert_eq!(errors.len(), 1, "{command:?}: {}", report(out));
+        assert!(errors[0].starts_with("error: locked: "), "{command:?}: {}", report(out));
+        assert!(!errors[0].contains(&*p.0.to_string_lossy()), "{command:?}: {}", report(out));
+        assert_eq!(named_file(&errors[0], "error:", &p.0), locked.canonicalize().unwrap());
+        assert!(String::from_utf8_lossy(&out.stdout).contains("a.rs:"), "{command:?}: {}", report(out));
+    }
+}
+
 #[test]
 fn inline_comments_are_not_part_of_a_section_value() {
     let config = "[sqlx-sqruff]\n\

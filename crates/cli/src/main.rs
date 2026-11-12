@@ -16,7 +16,7 @@ mod config;
 mod paths;
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, hash_map::Entry},
     fmt::Display,
     fs::{self, OpenOptions},
     io::{self, Write},
@@ -31,7 +31,7 @@ use ignore::{WalkBuilder, overrides::OverrideBuilder};
 use paths::shown;
 use sqlx_sqruff_core::{
     engine::{QueryChange, check_extracted, dump_extracted, fix_extracted},
-    extract::{QueryLiteral, extract_checked},
+    extract::{QueryLiteral, extract_checked, may_hold_a_query},
     sqruff_adapter::SqruffEngine,
 };
 
@@ -68,8 +68,9 @@ fn exit_status(codes: &str) -> String {
     format!(
         "Exit status:\n{codes}\n  \
          2  an error, each reported on an `error:` line: a path that does not exist\n     \
-         or selects no file to scan, a file that cannot be read, parsed as Rust or\n     \
-         written, or an invalid config or argument"
+         or selects no file to scan, a file that cannot be read or written, a file\n     \
+         that is not valid Rust (a file found by walking a directory is parsed only\n     \
+         when it contains the text `query`), or an invalid config or argument"
     )
 }
 
@@ -174,8 +175,12 @@ impl Errors {
     }
 
     /// The queries in `src`, the text of `path`, or `None` after reporting that
-    /// it is not valid Rust, at the position of the error.
-    fn extract(&mut self, path: &Path, src: &str) -> Option<Vec<QueryLiteral>> {
+    /// it is not valid Rust, at the position of the error. A file found by
+    /// walking a directory (not `named`) is parsed only when it may hold a query.
+    fn extract(&mut self, path: &Path, src: &str, named: bool) -> Option<Vec<QueryLiteral>> {
+        if !named && !may_hold_a_query(src) {
+            return Some(Vec::new());
+        }
         extract_checked(src)
             .map_err(|e| {
                 let first = e.message.lines().next().unwrap_or("parse error");
@@ -219,9 +224,9 @@ fn cmd_dump(a: ListArgs) -> Result<ExitCode> {
     }
     let settings = CliSettings::load(a.config.as_deref())?;
     let mut errors = Errors::default();
-    for path in collect_files(&a.paths, &settings, &mut errors)? {
+    for (path, named) in collect_files(&a.paths, &settings, &mut errors)? {
         let Some(src) = errors.read(&path) else { continue };
-        let Some(queries) = errors.extract(&path, &src) else { continue };
+        let Some(queries) = errors.extract(&path, &src, named) else { continue };
         for (line, sql) in dump_extracted(&queries) {
             println!("----- {}:{} -----\n{sql}", path.display(), line);
         }
@@ -250,12 +255,12 @@ fn cmd_check(a: CheckArgs) -> Result<ExitCode> {
     let mut errors = Errors::default();
     let mut total = 0usize;
     let mut failed_files = 0usize;
-    for path in collect_files(&a.paths, &settings, &mut errors)? {
+    for (path, named) in collect_files(&a.paths, &settings, &mut errors)? {
         let Some(src) = errors.read(&path) else {
             failed_files += 1;
             continue;
         };
-        let Some(queries) = errors.extract(&path, &src) else {
+        let Some(queries) = errors.extract(&path, &src, named) else {
             failed_files += 1;
             continue;
         };
@@ -292,12 +297,12 @@ fn cmd_fix(a: FixArgs) -> Result<ExitCode> {
     let mut changed_queries = 0usize;
     let mut not_applied = 0usize;
     let mut failed_files = 0usize;
-    for path in collect_files(&a.paths, &settings, &mut errors)? {
+    for (path, named) in collect_files(&a.paths, &settings, &mut errors)? {
         let Some(src) = errors.read(&path) else {
             failed_files += 1;
             continue;
         };
-        let Some(queries) = errors.extract(&path, &src) else {
+        let Some(queries) = errors.extract(&path, &src, named) else {
             failed_files += 1;
             continue;
         };
@@ -316,38 +321,31 @@ fn cmd_fix(a: FixArgs) -> Result<ExitCode> {
                 for (line, message) in &out.sqruff_errors {
                     warnings.push((*line, format!("fix not applied: sqruff failed: {message}")));
                 }
-                for (line, codes) in &out.layout_kept {
-                    warnings.push((
-                        *line,
-                        format!(
-                            "fix not applied: sqruff's change{} needs a different line layout; \
-                             write the query as a multi-line raw string (r#\"...\"#) or disable \
-                             the rule",
-                            rules(codes)
-                        ),
-                    ));
-                }
-                for (line, codes) in &out.partly_applied {
-                    warnings.push((
-                        *line,
-                        format!(
-                            "fix partly applied: the rest of sqruff's change{} needs a different \
-                             line layout and was not applied; write the query as a multi-line raw \
-                             string (r#\"...\"#) or disable the rule",
-                            rules(codes)
-                        ),
-                    ));
-                }
-                for (line, codes) in &out.unstable {
-                    warnings.push((
-                        *line,
-                        format!(
-                            "fix not applied: fixing the rewritten query again would change it \
-                             further{}; start the SQL on its own line after the opening quote, or \
-                             disable the rule",
-                            rules(codes)
-                        ),
-                    ));
+                // Each message is split where the rule codes go.
+                let with_codes = [
+                    (
+                        &out.layout_kept,
+                        "fix not applied: sqruff's change",
+                        " needs a different line layout; write the query as a multi-line raw \
+                         string (r#\"...\"#) or disable the rule",
+                    ),
+                    (
+                        &out.partly_applied,
+                        "fix partly applied: the rest of sqruff's change",
+                        " needs a different line layout and was not applied; write the query as a \
+                         multi-line raw string (r#\"...\"#) or disable the rule",
+                    ),
+                    (
+                        &out.unstable,
+                        "fix not applied: fixing the rewritten query again would change it further",
+                        "; start the SQL on its own line after the opening quote, or disable the \
+                         rule",
+                    ),
+                ];
+                for (entries, before, after) in with_codes {
+                    for (line, codes) in entries {
+                        warnings.push((*line, format!("{before}{}{after}", rules(codes))));
+                    }
                 }
                 for line in &out.unparsable_lines {
                     warnings.push((
@@ -460,9 +458,9 @@ fn cmd_list(a: ListArgs) -> Result<ExitCode> {
     }
     let settings = CliSettings::load(a.config.as_deref())?;
     let mut errors = Errors::default();
-    for path in collect_files(&a.paths, &settings, &mut errors)? {
+    for (path, named) in collect_files(&a.paths, &settings, &mut errors)? {
         let Some(src) = errors.read(&path) else { continue };
-        let Some(queries) = errors.extract(&path, &src) else { continue };
+        let Some(queries) = errors.extract(&path, &src, named) else { continue };
         for q in queries {
             println!("{}:{}", path.display(), q.line);
         }
@@ -471,7 +469,8 @@ fn cmd_list(a: ListArgs) -> Result<ExitCode> {
 }
 
 /// Discover the files to scan, each once, sorted by path and spelled as
-/// [`shown`] prints them.
+/// [`shown`] prints them, each with whether it was named on the command line
+/// rather than only found by walking a directory.
 ///
 /// - A directly-named **file** path is always processed, whatever its
 ///   extension, bypassing include/exclude and the ignore files — naming a file
@@ -483,21 +482,24 @@ fn cmd_list(a: ListArgs) -> Result<ExitCode> {
 /// - The globs are relative to `settings.base()`, else to the walked directory.
 ///
 /// A directory that cannot be read is reported in `errors` and skipped. A
-/// search root that selects no file is reported in `errors`, so that a run that
-/// misses a path it was given cannot pass.
+/// search root that selects no file, and whose walk reported no error, is
+/// reported in `errors`, so that a run that misses a path it was given cannot
+/// pass.
 fn collect_files(
     paths: &[PathBuf],
     settings: &CliSettings,
     errors: &mut Errors,
-) -> Result<Vec<PathBuf>> {
+) -> Result<Vec<(PathBuf, bool)>> {
     // `include` defines the default search set, so it only applies when the user
     // hasn't named their own paths. `exclude` always prunes.
     let use_include = paths.is_empty() && !settings.include.is_empty();
     let roots: Vec<PathBuf> =
         if paths.is_empty() { vec![PathBuf::from(".")] } else { paths.to_vec() };
 
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
+    // The index in `out` of each canonical path, so that a file found by a walk
+    // and also named is marked as named, whichever root comes first.
+    let mut seen: HashMap<PathBuf, usize> = HashMap::new();
+    let mut out: Vec<(PathBuf, bool)> = Vec::new();
     for root in &roots {
         let canonical_root = match root.canonicalize() {
             Ok(path) => path,
@@ -507,8 +509,12 @@ fn collect_files(
             }
         };
         if canonical_root.is_file() {
-            if seen.insert(canonical_root) {
-                out.push(shown(root));
+            match seen.entry(canonical_root) {
+                Entry::Occupied(at) => out[*at.get()].1 = true,
+                Entry::Vacant(at) => {
+                    at.insert(out.len());
+                    out.push((shown(root), true));
+                }
             }
             continue;
         }
@@ -531,21 +537,23 @@ fn collect_files(
         // Counts the files that another root already selected too, so that
         // naming a directory twice is not an error.
         let mut selected = 0usize;
+        let errors_before = errors.0;
         for entry in builder.build() {
             match entry {
                 Ok(entry) => {
                     let p = entry.path();
                     if entry.file_type().is_some_and(|t| t.is_file()) && is_rs(p) {
                         selected += 1;
-                        if seen.insert(p.to_path_buf()) {
-                            out.push(shown(&under_root(root, &canonical_root, p)));
+                        if let Entry::Vacant(at) = seen.entry(p.to_path_buf()) {
+                            at.insert(out.len());
+                            out.push((shown(&under_root(root, &canonical_root, p)), false));
                         }
                     }
                 }
                 Err(err) => report_walk_error(root, &canonical_root, &err, errors),
             }
         }
-        if selected == 0 {
+        if selected == 0 && errors.0 == errors_before {
             match settings.file.as_deref().filter(|_| use_include) {
                 Some(config) => errors.report(
                     config,
@@ -578,9 +586,22 @@ fn report_walk_error(root: &Path, canonical_root: &Path, err: &ignore::Error, er
         }
         ignore::Error::WithDepth { err, .. } => report_walk_error(root, canonical_root, err, errors),
         ignore::Error::WithPath { path, err } => {
-            errors.report(&under_root(root, canonical_root, path), err);
+            errors.report(&under_root(root, canonical_root, path), walk_message(err));
         }
-        _ => errors.report(root, err),
+        _ => errors.report(root, walk_message(err)),
+    }
+}
+
+/// The message of a walk error, without the absolute path that the walker adds
+/// to an I/O error: the `error:` line already names that path as [`shown`]
+/// spells it.
+fn walk_message(err: &ignore::Error) -> String {
+    match err {
+        ignore::Error::WithDepth { err, .. } => walk_message(err),
+        ignore::Error::Io(io) => {
+            io.get_ref().and_then(|inner| inner.source()).map_or_else(|| io.to_string(), ToString::to_string)
+        }
+        _ => err.to_string(),
     }
 }
 
@@ -650,7 +671,7 @@ mod tests {
         let mut got: Vec<String> = collect_files(paths, settings, &mut Errors::default())
             .unwrap()
             .into_iter()
-            .map(|p| {
+            .map(|(p, _)| {
                 let p = p.canonicalize().unwrap();
                 p.strip_prefix(&base).unwrap_or(&p).to_string_lossy().replace('\\', "/")
             })
@@ -707,7 +728,7 @@ mod tests {
             collect_files(std::slice::from_ref(&file), &settings, &mut Errors::default())
                 .unwrap()
                 .iter()
-                .map(|p| p.canonicalize().unwrap())
+                .map(|(p, _)| p.canonicalize().unwrap())
                 .collect();
         assert_eq!(got, [file.canonicalize().unwrap()]);
     }

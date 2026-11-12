@@ -205,6 +205,16 @@ pub fn fix_extracted(
                 unstable.push((q.line, codes));
                 continue;
             }
+            Ok(Recheck::Unparsable(codes)) => {
+                sqruff_errors.push((
+                    q.line,
+                    format!(
+                        "its fixed SQL no longer parses, or a rule failed on it ({})",
+                        codes.join(", ")
+                    ),
+                ));
+                continue;
+            }
             Err(e) => {
                 sqruff_errors.push((q.line, first_line(&e).to_string()));
                 continue;
@@ -262,6 +272,10 @@ enum Recheck {
     /// Fixing the literal again would rewrite it once more; sqruff reports
     /// these rules.
     Unstable(Vec<String>),
+    /// sqruff cannot fully parse the literal's SQL, or one of its rules failed
+    /// on it, with these codes: the fix broke the SQL, so it must not be
+    /// written.
+    Unparsable(Vec<String>),
 }
 
 /// Lint and fix a rewritten `literal` the way the next `fix` run would, so
@@ -273,13 +287,32 @@ fn recheck(literal: &str, engine: &SqruffEngine) -> Result<Recheck, String> {
     };
     let view = LintView::new(&lit.content);
     let (fixed, findings) = engine.fix(&view.sql)?;
-    if fixed == view.sql {
-        return Ok(Recheck::Clean);
+    Ok(recheck_outcome(literal, &lit, &view, &fixed, &findings))
+}
+
+/// The [`recheck`] of `literal`, read back as `lit` and `view`, given sqruff's
+/// `fixed` SQL and `findings` for `view`.
+fn recheck_outcome(
+    literal: &str,
+    lit: &ParsedLiteral,
+    view: &LintView,
+    fixed: &str,
+    findings: &[Finding],
+) -> Recheck {
+    let mut unparsable: Vec<String> =
+        findings.iter().filter(|f| f.unparsable).map(|f| f.code.clone()).collect();
+    if !unparsable.is_empty() {
+        unparsable.sort();
+        unparsable.dedup();
+        return Recheck::Unparsable(unparsable);
     }
-    let codes = fixable_codes(&findings);
-    match rebuild_literal(&lit, &view.indent, &fixed) {
-        Some((again, _)) if again != literal => Ok(Recheck::Unstable(codes)),
-        _ => Ok(Recheck::Residual(codes)),
+    if fixed == view.sql {
+        return Recheck::Clean;
+    }
+    let codes = fixable_codes(findings);
+    match rebuild_literal(lit, &view.indent, fixed) {
+        Some((again, _)) if again != literal => Recheck::Unstable(codes),
+        _ => Recheck::Residual(codes),
     }
 }
 
@@ -391,6 +424,32 @@ mod tests {
     fn engine() -> SqruffEngine {
         SqruffEngine::from_source("[sqruff]\ndialect = postgres\nrules = CV05,ST01,ST02\n")
             .expect("engine")
+    }
+
+    #[test]
+    fn a_rebuilt_literal_whose_sql_sqruff_cannot_parse_is_not_written() {
+        // No known SQL makes a sqruff 0.44 fix produce SQL that sqruff cannot
+        // parse, so the findings on the rebuilt literal are built here.
+        let literal = "\"SELECT a FROM t WHERE\"";
+        let lit = ParsedLiteral::parse(literal).unwrap();
+        let view = LintView::new(&lit.content);
+        for code in [crate::diagnostic::PARSE, crate::diagnostic::LEX, INTERNAL] {
+            let finding = Finding {
+                code: code.to_string(),
+                line: 1,
+                col: 1,
+                desc: String::new(),
+                fixable: false,
+                unparsable: true,
+            };
+            for fixed in [view.sql.clone(), "SELECT a FROM t".to_string()] {
+                let outcome = recheck_outcome(literal, &lit, &view, &fixed, std::slice::from_ref(&finding));
+                assert!(
+                    matches!(&outcome, Recheck::Unparsable(codes) if *codes == [code]),
+                    "{code}, fixed into {fixed:?}"
+                );
+            }
+        }
     }
 
     #[test]

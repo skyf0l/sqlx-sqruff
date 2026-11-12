@@ -128,6 +128,26 @@ fn a_file_that_does_not_parse_as_rust_is_named_with_the_line_and_column_of_the_e
 }
 
 #[test]
+fn a_named_file_is_parsed_even_without_a_query_but_a_walked_one_only_with_one() {
+    let not_rust = b"fn f( {{{ not rust\n";
+    let p = Project::new("named_not_rust", &[("a.rs", b"fn f() {}\n"), ("broken.rs", not_rust)]);
+    for command in [&["check"][..], &["fix", "--check"], &["fix"], &["list"], &["dump"]] {
+        for paths in [&["broken.rs"][..], &[".", "broken.rs"], &["broken.rs", "."]] {
+            let mut args = command.to_vec();
+            args.extend(paths);
+            let out = p.run(&args);
+            assert_eq!(out.status.code(), Some(2), "{command:?} {paths:?}: {}", report(&out));
+            assert!(stderr_has(&out, "error: broken.rs:1:", "Rust"), "{command:?} {paths:?}: {}", report(&out));
+        }
+        let mut args = command.to_vec();
+        args.push(".");
+        let walked = p.run(&args);
+        assert_eq!(walked.status.code(), Some(0), "{command:?}: {}", report(&walked));
+    }
+    assert_eq!(fs::read(p.0.join("broken.rs")).unwrap(), not_rust);
+}
+
+#[test]
 fn check_and_fix_count_the_files_that_failed_in_the_same_words() {
     let unparsable = b"fn f() {\n    let _ = sqlx::query!(\"SELECT a FROM t WHERE x = NULL\");\n";
     let p = Project::new("summary", &[("a.rs", FIXABLE.as_bytes()), ("b.rs", unparsable)]);
