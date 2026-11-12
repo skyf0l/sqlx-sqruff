@@ -24,7 +24,7 @@ checks as standalone `.sql` files.
   and layout, applied automatically with `fix`.
 - **Catches real problems.** Unused CTEs and joins, `LIMIT` without
   `ORDER BY`, redundant `CASE` / `ELSE NULL`, and more, surfaced right inside
-  your Rust source at `file:line:col` (human or JSON output).
+  your Rust source at `file:line:col` (human or JSON Lines output).
 - **Postgres-correct out of the box.** Understands sqlx-specific casts like
   `as "col!: Type"` that trip up ansi-default SQL tooling (any dialect via
   `--dialect`).
@@ -49,7 +49,7 @@ Windows aarch64) are attached to each
 
 ```bash
 sqlx-sqruff check  [PATHS...]              # lint, non-zero on findings
-sqlx-sqruff check  [PATHS...] --format json  # one JSON object per finding (JSON Lines)
+sqlx-sqruff check  [PATHS...] --format jsonl  # one JSON object per finding (JSON Lines)
 sqlx-sqruff fix    [PATHS...]              # apply fixes, write back
 sqlx-sqruff fix    [PATHS...] --check      # CI gate, no writes, shows each change
 sqlx-sqruff list   [PATHS...]              # debug: list extracted queries
@@ -68,8 +68,8 @@ With `--check`, `fix` prints each query it would change: its `path:line`, the
 current literal with every line prefixed by `- `, then the fixed literal with
 every line prefixed by `+ `.
 
-With `--format json`, `check` prints one JSON object per line, with the keys
-`file`, `line`, `col` (1-based, in characters), `code` and `message`.
+`check` prints one line per finding, `path:line:col: CODE message`, or with
+`--format jsonl` one JSON object per finding; see [Output](#output).
 
 Exit codes:
 
@@ -119,6 +119,32 @@ that then replaces the original, so an interrupted run never leaves a
 half-written file. The file keeps its permissions, a file named through a
 symbolic link is written through the link, and a read-only file is reported as
 an error instead of being replaced.
+
+### Output
+
+`check` prints one line per finding: `path:line:col: CODE message`. With
+`--format jsonl`, it prints one JSON object per line instead (JSON Lines), with
+the keys `file`, `line`, `col` (1-based, in characters), `code` and `message`.
+
+`CODE` is the sqruff rule code (`CP01`, `LT01`, ...), or one of these codes for
+a finding that is not a rule violation:
+
+| Code | Meaning |
+| ---- | ------- |
+| `PARSE` | sqruff could not parse the SQL with the configured dialect. |
+| `LEX` | sqruff could not split the SQL into tokens, for example at an unclosed quote. sqruff then also reports `PARSE` at the same place. |
+| `NOQA` | a `-- noqa` comment that sqruff cannot read, or, when sqruff's `warn_unused_ignores` is set, one that silences nothing. |
+| `INTERNAL` | sqruff failed on the query, for example on an invalid inline `-- sqruff:` config line, or one of its rules failed. The message says why. |
+
+Every path the tool prints (in findings, `list`, `dump`, the output of `fix`,
+warnings and errors) is spelled the same however you named it on the command
+line: relative to the current directory, without a leading `./`, when the file
+is inside it, and absolute otherwise. Paths use the separator of the operating
+system, so `src\a.rs` on Windows.
+
+Every command prints its results sorted by path, then line, then column. Paths
+are compared one component at a time, so `src/m/x.rs` comes before `src/m.rs`,
+and absolute paths come before relative ones.
 
 ### Config resolution
 

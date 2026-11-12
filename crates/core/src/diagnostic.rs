@@ -1,5 +1,17 @@
 //! A finding mapped back to a location *inside the Rust file*, plus renderers.
 
+/// Code of a finding where sqruff could not parse the SQL with the configured
+/// dialect.
+pub const PARSE: &str = "PARSE";
+/// Code of a finding where sqruff could not split the SQL into tokens.
+pub const LEX: &str = "LEX";
+/// Code of a finding on a `-- noqa` comment that sqruff cannot read, or that
+/// silences nothing when sqruff's `warn_unused_ignores` is set.
+pub const NOQA: &str = "NOQA";
+/// Code of a finding where sqruff failed on the query, for example on an
+/// invalid inline `-- sqruff:` config line, or a rule failed inside sqruff.
+pub const INTERNAL: &str = "INTERNAL";
+
 #[derive(Debug, Clone)]
 pub struct Diagnostic {
     pub file: String,

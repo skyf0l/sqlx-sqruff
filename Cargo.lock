@@ -769,6 +769,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ignore",
+ "serde_json",
  "sqlx-sqruff-core",
 ]
 

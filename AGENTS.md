@@ -15,10 +15,19 @@ before changing behaviour, and update them in the same change.
     sqruff) together with the mapping back to source positions.
   - `engine.rs`: `check` maps findings to `.rs` line and column; `fix` rebuilds
     literals and splices them back.
-  - `sqruff_adapter.rs`: the only module that uses `sqruff-lib`.
+  - `sqruff_adapter.rs`: the only module that uses `sqruff-lib`. It turns
+    sqruff's codes for findings that are not rules (`????`, `LXR`) into the
+    codes defined in `diagnostic.rs`.
   - `line_index.rs`, `diagnostic.rs`: positions and output rendering.
 - `crates/cli` (`sqlx-sqruff`, binary): argument parsing, file selection, the
   `[sqlx-sqruff]` config section (`config.rs`), output and exit codes.
+  `paths.rs` gives every printed path its one spelling; `collect_files` applies
+  it to each file and sorts the files, so output stays in path order.
+
+The output formats, finding codes, path spelling and output order in the
+README's Output section are promises to users' scripts: change them only on
+purpose, and update that section and the tests in
+`crates/cli/tests/output_format.rs` with them.
 
 ## Gates
 

@@ -13,6 +13,7 @@
 //! every `.rs` file is scanned, respecting `.gitignore`.
 
 mod config;
+mod paths;
 
 use std::{
     collections::HashSet,
@@ -27,6 +28,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use config::CliSettings;
 use ignore::{WalkBuilder, overrides::OverrideBuilder};
+use paths::shown;
 use sqlx_sqruff_core::{
     engine::{QueryChange, check_extracted, dump_extracted, fix_extracted},
     extract::extract_checked,
@@ -70,6 +72,7 @@ struct CheckArgs {
     paths: Vec<PathBuf>,
     #[command(flatten)]
     cfg: ConfigOpts,
+    /// Output format of the findings.
     #[arg(long, value_enum, default_value_t = OutFmt::Human)]
     format: OutFmt,
 }
@@ -94,8 +97,11 @@ struct ListArgs {
 
 #[derive(Clone, ValueEnum)]
 enum OutFmt {
+    /// One `path:line:col: CODE message` line per finding.
     Human,
-    Json,
+    /// One JSON object per finding, each on its own line (JSON Lines), with the
+    /// keys `file`, `line`, `col`, `code` and `message`.
+    Jsonl,
 }
 
 fn main() -> ExitCode {
@@ -125,7 +131,7 @@ struct Errors(usize);
 
 impl Errors {
     fn report(&mut self, path: &Path, err: impl Display) {
-        eprintln!("error: {}: {err}", path.display());
+        eprintln!("error: {}: {err}", shown(path).display());
         self.0 += 1;
     }
 
@@ -152,9 +158,9 @@ fn all_paths_exist(paths: &[PathBuf]) -> bool {
     for path in paths {
         if let Err(e) = fs::metadata(path) {
             if e.kind() == io::ErrorKind::NotFound {
-                eprintln!("error: {}: no such file or directory", path.display());
+                eprintln!("error: {}: no such file or directory", shown(path).display());
             } else {
-                eprintln!("error: {}: {e}", path.display());
+                eprintln!("error: {}: {e}", shown(path).display());
             }
             all_exist = false;
         }
@@ -214,7 +220,7 @@ fn cmd_check(a: CheckArgs) -> Result<ExitCode> {
             total += 1;
             match a.format {
                 OutFmt::Human => println!("{}", d.render_human()),
-                OutFmt::Json => println!("{}", d.render_json()),
+                OutFmt::Jsonl => println!("{}", d.render_json()),
             }
         }
     }
@@ -259,45 +265,63 @@ fn cmd_fix(a: FixArgs) -> Result<ExitCode> {
         };
         match fix_extracted(&p, &src, &queries, &engine) {
             Ok(out) => {
+                let mut warnings: Vec<(usize, String)> = Vec::new();
                 for line in &out.dropped_lines {
-                    eprintln!(
-                        "warning: {p}:{line}: fix not applied: the rewritten literal would not \
-                         keep the intended string value"
-                    );
+                    warnings.push((
+                        *line,
+                        "fix not applied: the rewritten literal would not keep the intended \
+                         string value"
+                            .to_string(),
+                    ));
                 }
                 for (line, message) in &out.sqruff_errors {
-                    eprintln!("warning: {p}:{line}: fix not applied: sqruff failed: {message}");
+                    warnings.push((*line, format!("fix not applied: sqruff failed: {message}")));
                 }
                 for (line, codes) in &out.layout_kept {
-                    eprintln!(
-                        "warning: {p}:{line}: fix not applied: sqruff's change{} needs a different \
-                         line layout; write the query as a multi-line raw string (r#\"...\"#) or \
-                         disable the rule",
-                        rules(codes)
-                    );
+                    warnings.push((
+                        *line,
+                        format!(
+                            "fix not applied: sqruff's change{} needs a different line layout; \
+                             write the query as a multi-line raw string (r#\"...\"#) or disable \
+                             the rule",
+                            rules(codes)
+                        ),
+                    ));
                 }
                 for (line, codes) in &out.partly_applied {
-                    eprintln!(
-                        "warning: {p}:{line}: fix partly applied: the rest of sqruff's change{} \
-                         needs a different line layout and was not applied; write the query as a \
-                         multi-line raw string (r#\"...\"#) or disable the rule",
-                        rules(codes)
-                    );
+                    warnings.push((
+                        *line,
+                        format!(
+                            "fix partly applied: the rest of sqruff's change{} needs a different \
+                             line layout and was not applied; write the query as a multi-line raw \
+                             string (r#\"...\"#) or disable the rule",
+                            rules(codes)
+                        ),
+                    ));
                 }
                 for (line, codes) in &out.unstable {
-                    eprintln!(
-                        "warning: {p}:{line}: fix not applied: fixing the rewritten query again \
-                         would change it further{}; start the SQL on its own line after the \
-                         opening quote, or disable the rule",
-                        rules(codes)
-                    );
+                    warnings.push((
+                        *line,
+                        format!(
+                            "fix not applied: fixing the rewritten query again would change it \
+                             further{}; start the SQL on its own line after the opening quote, or \
+                             disable the rule",
+                            rules(codes)
+                        ),
+                    ));
                 }
                 for line in &out.unparsable_lines {
-                    eprintln!(
-                        "warning: {p}:{line}: fix not applied: sqruff could not fully parse this \
-                         SQL with the configured dialect, so its fix may change the query; \
-                         check the dialect or the SQL"
-                    );
+                    warnings.push((
+                        *line,
+                        "fix not applied: sqruff could not fully parse this SQL with the \
+                         configured dialect, so its fix may change the query; check the dialect \
+                         or the SQL"
+                            .to_string(),
+                    ));
+                }
+                warnings.sort_by_key(|(line, _)| *line);
+                for (line, warning) in &warnings {
+                    eprintln!("warning: {p}:{line}: {warning}");
                 }
                 if out.skipped_escapes > 0 {
                     eprintln!(
@@ -371,7 +395,7 @@ fn write_atomically(path: &Path, contents: &str) -> io::Result<()> {
         return match fs::remove_file(&tmp) {
             Err(cleanup) if cleanup.kind() != io::ErrorKind::NotFound => Err(io::Error::new(
                 err.kind(),
-                format!("{err} (and could not remove {}: {cleanup})", tmp.display()),
+                format!("{err} (and could not remove {}: {cleanup})", shown(&tmp).display()),
             )),
             _ => Err(err),
         };
@@ -413,7 +437,8 @@ fn cmd_list(a: ListArgs) -> Result<ExitCode> {
     Ok(errors.exit_code(false))
 }
 
-/// Discover the `.rs` files to scan, each once, in the order first found.
+/// Discover the `.rs` files to scan, each once, sorted by path and spelled as
+/// [`shown`] prints them.
 ///
 /// - A directly-named **file** path is always processed (if it ends in `.rs`),
 ///   bypassing include/exclude — naming a file means you want it scanned.
@@ -447,7 +472,7 @@ fn collect_files(
         };
         if canonical_root.is_file() {
             if is_rs(root) && seen.insert(canonical_root) {
-                out.push(root.clone());
+                out.push(shown(root));
             }
             continue;
         }
@@ -465,7 +490,8 @@ fn collect_files(
             .git_exclude(rg)
             .ignore(rg)
             .parents(rg)
-            .require_git(false);
+            .require_git(false)
+            .sort_by_file_name(|a, b| a.cmp(b));
         for entry in builder.build() {
             match entry {
                 Ok(entry) => {
@@ -474,13 +500,14 @@ fn collect_files(
                         && is_rs(p)
                         && seen.insert(p.to_path_buf())
                     {
-                        out.push(under_root(root, &canonical_root, p));
+                        out.push(shown(&under_root(root, &canonical_root, p)));
                     }
                 }
                 Err(err) => report_walk_error(root, &canonical_root, &err, errors),
             }
         }
     }
+    out.sort();
     Ok(out)
 }
 
@@ -563,12 +590,18 @@ mod tests {
         }
     }
 
-    /// Collect, then return base-relative `/`-separated paths, sorted.
+    /// Collect, then return base-relative `/`-separated paths, sorted. Paths
+    /// are compared canonically, because the files are outside the current
+    /// directory and so are printed resolved.
     fn collect_rel(paths: &[PathBuf], settings: &CliSettings, base: &Path) -> Vec<String> {
+        let base = base.canonicalize().unwrap();
         let mut got: Vec<String> = collect_files(paths, settings, &mut Errors::default())
             .unwrap()
             .into_iter()
-            .map(|p| p.strip_prefix(base).unwrap_or(&p).to_string_lossy().replace('\\', "/"))
+            .map(|p| {
+                let p = p.canonicalize().unwrap();
+                p.strip_prefix(&base).unwrap_or(&p).to_string_lossy().replace('\\', "/")
+            })
             .collect();
         got.sort();
         got
@@ -618,8 +651,12 @@ mod tests {
         // An include whitelist that the file does not match must not exclude a
         // directly-named file.
         let settings = CliSettings { include: vec!["nomatch/**".into()], ..no_vcs() };
-        let got =
-            collect_files(std::slice::from_ref(&file), &settings, &mut Errors::default()).unwrap();
-        assert_eq!(got, [file]);
+        let got: Vec<PathBuf> =
+            collect_files(std::slice::from_ref(&file), &settings, &mut Errors::default())
+                .unwrap()
+                .iter()
+                .map(|p| p.canonicalize().unwrap())
+                .collect();
+        assert_eq!(got, [file.canonicalize().unwrap()]);
     }
 }

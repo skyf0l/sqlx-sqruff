@@ -3,7 +3,7 @@
 use std::cmp::Reverse;
 
 use crate::{
-    diagnostic::Diagnostic,
+    diagnostic::{Diagnostic, INTERNAL},
     extract::{QueryLiteral, extract},
     line_index::LineIndex,
     literal::{self, LintView, LiteralKind, ParsedLiteral},
@@ -54,7 +54,7 @@ pub fn check_extracted(
                     file: path.to_string(),
                     line,
                     col,
-                    code: "ERROR".to_string(),
+                    code: INTERNAL.to_string(),
                     message: first_line(&e).to_string(),
                 });
                 continue;
@@ -578,7 +578,7 @@ mod tests {
     #[test]
     fn check_reports_a_sqruff_error_at_the_literal() {
         let diags = check_file("f.rs", SQRUFF_ERROR_SRC, &engine());
-        let errors: Vec<_> = diags.iter().filter(|d| d.code == "ERROR").collect();
+        let errors: Vec<_> = diags.iter().filter(|d| d.code == "INTERNAL").collect();
         assert_eq!(errors.len(), 1, "{diags:?}");
         assert_eq!((errors[0].line, errors[0].col), (2, 29));
         assert!(!errors[0].message.is_empty() && !errors[0].message.contains('\n'), "{errors:?}");
@@ -604,7 +604,7 @@ mod tests {
     fn position_in_one_line_normal_literal() {
         let src = "fn f() {\n    let _ = sqlx::query!(\"SELECT FROM WHERE ((\");\n}\n";
         // sqruff reports the unclosed bracket at the second `(`.
-        assert_eq!(positions(src), [(2, 46, "????".to_string())]);
+        assert_eq!(positions(src), [(2, 46, "PARSE".to_string())]);
     }
 
     #[test]
@@ -885,6 +885,17 @@ mod tests {
         let out = fix_file("f.rs", src, &eng).unwrap();
         assert_eq!(out.new_src, None);
         assert_eq!(out.unparsable_lines, [2]);
+    }
+
+    #[test]
+    fn a_malformed_noqa_comment_is_reported_and_does_not_stop_fix() {
+        let src = "fn f() {\n    let _ = sqlx::query!(\"SELECT a FROM t WHERE x = NULL -- noqa:\");\n}\n";
+        let diags = check_file("f.rs", src, &engine());
+        assert!(diags.iter().any(|d| d.code == "NOQA"), "{diags:?}");
+        let out = fix_file("f.rs", src, &engine()).unwrap();
+        assert!(out.unparsable_lines.is_empty(), "{:?}", out.unparsable_lines);
+        let fixed = out.new_src.expect("should change");
+        assert!(fixed.contains("x IS NULL -- noqa:"), "{fixed}");
     }
 
     #[test]
