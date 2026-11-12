@@ -147,19 +147,6 @@ fn a_named_file_is_parsed_even_without_a_query_but_a_walked_one_only_with_one() 
     assert_eq!(fs::read(p.0.join("broken.rs")).unwrap(), not_rust);
 }
 
-#[test]
-fn check_and_fix_count_the_files_that_failed_in_the_same_words() {
-    let unparsable = b"fn f() {\n    let _ = sqlx::query!(\"SELECT a FROM t WHERE x = NULL\");\n";
-    let p = Project::new("summary", &[("a.rs", FIXABLE.as_bytes()), ("b.rs", unparsable)]);
-    for command in [&["check"][..], &["fix", "--check"], &["fix"]] {
-        let mut args = command.to_vec();
-        args.extend(["a.rs", "b.rs"]);
-        let out = p.run(&args);
-        assert_eq!(out.status.code(), Some(2), "{command:?}: {}", report(&out));
-        assert!(stderr_has(&out, "", "; 1 file(s) failed."), "{command:?}: {}", report(&out));
-    }
-}
-
 #[cfg(unix)]
 #[test]
 fn a_file_that_cannot_be_written_is_named_and_fix_continues() {
@@ -174,7 +161,7 @@ fn a_file_that_cannot_be_written_is_named_and_fix_continues() {
     let out = p.run(&["fix", "a.rs", "b.rs", "c.rs"]);
     assert_eq!(out.status.code(), Some(2), "{}", report(&out));
     assert!(stderr_has(&out, "error: b.rs:", ""), "{}", report(&out));
-    assert!(stderr_has(&out, "", "file(s) failed"), "{}", report(&out));
+    assert!(stderr_has(&out, "", "error(s)"), "{}", report(&out));
     assert_eq!(p.read("b.rs"), FIXABLE.as_bytes());
     for fixed in ["a.rs", "c.rs"] {
         assert_ne!(p.read(fixed), FIXABLE.as_bytes(), "{fixed}: {}", report(&out));

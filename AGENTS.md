@@ -26,7 +26,11 @@ before changing behaviour, and update them in the same change.
 - `crates/cli` (`sqlx-sqruff`, binary): argument parsing, file selection, the
   `[sqlx-sqruff]` config section (`config.rs`), output and exit codes.
   `paths.rs` gives every printed path its one spelling; `collect_files` applies
-  it to each file and sorts the files, so output stays in path order.
+  it to each file and sorts the files, so output stays in path order. It
+  returns the errors it finds (walk errors, paths that select nothing) as
+  entries of the same sorted list, which the commands report when they reach
+  them, so the `error:` lines are in path order too. Missing named paths are
+  reported, sorted, before any work, and stop the run.
 
 The output formats, finding codes, path spelling and output order in the
 README's Output section are promises to users' scripts: change them only on
@@ -84,6 +88,16 @@ covered by tests:
   reports findings on is counted as not applied, with its rule codes, so the
   summary of `fix` matches what `fix --check` and `check` report afterwards.
   Keep that call the one place every rebuilt literal passes through.
+- The rule codes of a literal reported as not applied (`layout_kept`,
+  `partly_applied`, `unstable`, `unsettled`) are the fixable codes that
+  `check` reports on the literal that stays in the file, taken from a lint run
+  by `push_checked_codes`, not from sqruff's fix run: in a fix run, each rule
+  sees the SQL after the fixes of the rules before it, so its codes can differ.
+  An unstable literal whose SQL starts right after the opening quote and
+  continues on more lines of SQL (`LintView::sql` has more than one line, so
+  not just a closing quote on its own line) goes to `unstable` (the warning suggests starting
+  the SQL on its own line); any other goes to `unsettled` (sqruff's own fixes
+  do not settle, and the warning suggests disabling a rule).
 - Literal parsing must match the compiler. Add new escape or delimiter cases to
   `content_matches_the_compiler_value`, which compares with `syn`'s
   `LitStr::value()`.

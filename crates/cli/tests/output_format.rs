@@ -1,6 +1,6 @@
 //! The output formats that scripts depend on: finding codes, `--format jsonl`,
-//! the spelling of file paths and the order of the output, through the real
-//! binary.
+//! the spelling of file paths, the order of the output and of the `error:`
+//! lines, and the summary line, through the real binary.
 
 use std::{
     fs,
@@ -309,4 +309,107 @@ fn fix_warnings_of_a_file_are_ordered_by_line() {
         .filter_map(|l| l.strip_prefix("warning: a.rs:")?.split(':').next()?.parse().ok())
         .collect();
     assert_eq!(lines, [2, 3], "{}", report(&out));
+}
+
+/// The paths that the `error:` lines name, in the order they were printed.
+fn error_paths(out: &Output) -> Vec<PathBuf> {
+    String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .filter_map(|l| l.strip_prefix("error: "))
+        .map(|rest| PathBuf::from(rest.split(':').next().unwrap_or_default()))
+        .collect()
+}
+
+/// Not valid Rust, and parsed even when found by walking a directory.
+const NOT_RUST: &[u8] = b"fn f( { query\n";
+
+/// The commands that report `error:` lines, with each way of running `fix`.
+const ERROR_COMMANDS: [&[&str]; 5] = [&["check"], &["fix", "--check"], &["fix"], &["list"], &["dump"]];
+
+#[test]
+fn error_lines_are_in_path_order_whatever_the_order_of_the_named_paths() {
+    let p = Project::new("error_order", &[("a.rs", NOT_RUST), ("b/notes.txt", CV05_QUERY.as_bytes()), ("c.rs", NOT_RUST)]);
+    for command in ERROR_COMMANDS {
+        for (orders, expected) in [
+            ([&["nosuchdir", "nosuch.rs"][..], &["nosuch.rs", "nosuchdir"]], &["nosuch.rs", "nosuchdir"][..]),
+            ([&["c.rs", "b", "a.rs"], &["a.rs", "b", "c.rs"]], &["a.rs", "b", "c.rs"]),
+        ] {
+            let outs = orders.map(|paths| p.run("", &[command, paths].concat()));
+            for (paths, out) in orders.iter().zip(&outs) {
+                assert_eq!(out.status.code(), Some(2), "{command:?} {paths:?}: {}", report(out));
+                let expected: Vec<PathBuf> = expected.iter().map(PathBuf::from).collect();
+                assert_eq!(error_paths(out), expected, "{command:?} {paths:?}: {}", report(out));
+            }
+            assert_eq!(outs[0].stderr, outs[1].stderr, "{command:?}: {}\n{}", report(&outs[0]), report(&outs[1]));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_directory_found_by_walking_is_reported_in_path_order() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let p = Project::new("error_order_walk", &[("a.rs", NOT_RUST), ("m/b.rs", CV05_QUERY.as_bytes()), ("z.rs", NOT_RUST)]);
+    let locked = p.path("m");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let outs: Vec<_> = ERROR_COMMANDS.into_iter().map(|command| (command, p.run("", command))).collect();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let expected: Vec<PathBuf> = ["a.rs", "m", "z.rs"].iter().map(PathBuf::from).collect();
+    for (command, out) in &outs {
+        assert_eq!(out.status.code(), Some(2), "{command:?}: {}", report(out));
+        assert_eq!(error_paths(out), expected, "{command:?}: {}", report(out));
+    }
+}
+
+/// A file that does not parse as Rust because its closing brace is missing.
+const UNPARSABLE: &[u8] = b"fn f() {\n    let _ = sqlx::query!(\"SELECT a FROM t WHERE x = NULL\");\n";
+
+#[test]
+fn check_and_fix_count_the_errors_in_the_same_words() {
+    let p = Project::new("summary", &[("a.rs", CV05_QUERY.as_bytes()), ("b.rs", UNPARSABLE)]);
+    for command in [&["check"][..], &["fix", "--check"], &["fix"]] {
+        let out = p.run("", &[command, &["a.rs", "b.rs"]].concat());
+        assert_eq!(out.status.code(), Some(2), "{command:?}: {}", report(&out));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.lines().any(|l| l.contains("; 1 error(s).")), "{command:?}: {}", report(&out));
+    }
+}
+
+/// The `N` of the `N error(s).` that ends the summary on the last stderr line.
+fn summary_errors(out: &Output) -> usize {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let last = stderr.lines().last().unwrap_or_default();
+    let count = last.strip_suffix(" error(s).").and_then(|rest| rest.rsplit(' ').next()).and_then(|n| n.parse().ok());
+    count.unwrap_or_else(|| panic!("no error count in {last:?}: {}", report(out)))
+}
+
+#[test]
+fn the_summary_counts_every_error_line_including_the_paths_that_select_no_file() {
+    let p = Project::new("summary_paths", &[("a.rs", CV05_QUERY.as_bytes()), ("b.rs", UNPARSABLE)]);
+    fs::create_dir_all(p.path("empty")).unwrap();
+    let paths: Vec<&str> = ["a.rs", "b.rs", "empty"].into_iter().chain(cfg!(unix).then_some("locked")).collect();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(p.path("locked")).unwrap();
+        fs::set_permissions(p.path("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    let outs: Vec<_> = [&["check"][..], &["fix", "--check"], &["fix"]]
+        .into_iter()
+        .map(|command| (command, p.run("", &[command, paths.as_slice()].concat())))
+        .collect();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(p.path("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    for (command, out) in &outs {
+        assert_eq!(out.status.code(), Some(2), "{command:?}: {}", report(out));
+        let errors = String::from_utf8_lossy(&out.stderr).lines().filter(|l| l.starts_with("error:")).count();
+        assert_eq!(errors, paths.len() - 1, "{command:?}: {}", report(out));
+        assert_eq!(summary_errors(out), errors, "{command:?}: {}", report(out));
+    }
 }

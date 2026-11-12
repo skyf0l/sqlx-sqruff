@@ -267,7 +267,7 @@ fn not_applied_count(out: &Output) -> usize {
     let err = stderr(out);
     let summary = err
         .lines()
-        .find(|l| l.contains(" not applied;") && l.contains(" file(s) failed."))
+        .find(|l| l.contains(" not applied;") && l.contains(" error(s)."))
         .unwrap_or_else(|| panic!("no summary in:\n{err}"));
     let before = summary.split(" not applied;").next().unwrap_or_default();
     before.rsplit(' ').next().and_then(|n| n.parse().ok()).unwrap_or_else(|| panic!("no count in {summary:?}"))
@@ -305,6 +305,77 @@ fn a_fix_whose_line_breaks_cannot_be_applied_is_counted_as_not_applied_by_fix_an
     assert_eq!(again.status.code(), Some(0), "{}", stderr(&again));
     assert_eq!(not_applied_count(&again), not_applied_count(&fix), "{}", stderr(&again));
     assert_eq!(p.src(), fixed);
+}
+
+/// The rule codes that `warning` names in parentheses, sorted.
+fn warned_codes(warning: &str) -> Vec<String> {
+    let codes = warning.split_once(" (").and_then(|(_, rest)| rest.split_once(')')).map_or("", |(codes, _)| codes);
+    let mut codes: Vec<String> = codes.split(", ").filter(|c| !c.is_empty()).map(str::to_string).collect();
+    codes.sort();
+    codes
+}
+
+/// The distinct rule codes of the findings that `check` printed, sorted. The
+/// files in the test below hold one query each, so these are that query's
+/// codes, including those of the findings that sqruff cannot fix.
+fn checked_codes(check: &Output) -> Vec<String> {
+    let findings = String::from_utf8_lossy(&check.stdout).into_owned();
+    let mut codes: Vec<String> = findings.lines().filter_map(|l| l.split_whitespace().nth(1)).map(str::to_string).collect();
+    codes.sort();
+    codes.dedup();
+    codes
+}
+
+#[test]
+fn a_query_whose_fix_would_change_again_is_reported_with_the_rules_check_reports_and_advice_for_its_shape() {
+    // Only a first SQL line stuck to the opening quote can make the fix grow
+    // the shared indent; on the other two, sqruff's own fixes do not settle.
+    for (tag, config, src, stuck) in [
+        (
+            "unstable_stuck",
+            "[sqruff]\ndialect = postgres\nrules = LT02,CV05\n",
+            "fn f() {\n    let _ = sqlx::query!(\"SELECT a FROM t WHERE\n            b = NULL\");\n}\n",
+            true,
+        ),
+        (
+            "unsettled_join",
+            "[sqruff]\ndialect = postgres\nrules = all\n",
+            "fn f() {\n    let _ = sqlx::query!(r#\"\n        SELECT id FROM (\n            SELECT a.id FROM alpha AS a INNER JOIN beta AS b ON a.id = b.alpha_id\n            UNION\n            SELECT a.id FROM beta AS b INNER JOIN alpha AS a ON b.alpha_id = a.id\n        ) AS choices\n    \"#);\n}\n",
+            false,
+        ),
+        (
+            "unsettled_line_length",
+            "[sqruff]\ndialect = postgres\nrules = LT05,LT09\nmax_line_length = 60\n",
+            "fn f() {\n    let _ = sqlx::query_as!(Row, r#\"\n        SELECT\n            compute_total(o.amount, o.discount) AS \"total!: Amount\"\n        FROM orders AS o\n        WHERE o.id = $1\n    \"#, id);\n}\n",
+            false,
+        ),
+    ] {
+        let p = Project::new(tag, config, src);
+        let check = p.run(&["check"]);
+        assert_eq!(check.status.code(), Some(1), "{tag}: {}", stderr(&check));
+        let checked = checked_codes(&check);
+
+        let mut printed = Vec::new();
+        for (args, status) in [(&["fix", "--check"][..], 1), (&["fix"], 0)] {
+            let out = p.run(args);
+            assert_eq!(out.status.code(), Some(status), "{tag} {args:?}: {}", stderr(&out));
+            assert_eq!(not_applied_count(&out), 1, "{tag} {args:?}: {}", stderr(&out));
+            assert_eq!(p.src(), src, "{tag} {args:?}");
+            let warnings = lines_naming(&out, 2);
+            assert_eq!(warnings.len(), 1, "{tag} {args:?}: {}", stderr(&out));
+            let warning = &warnings[0];
+            assert!(warning.starts_with(&format!("warning: {FILE}:2: fix not applied:")), "{tag} {args:?}: {warning}");
+            // `check` also reports the findings that sqruff cannot fix, which
+            // no warning names.
+            let warned = warned_codes(warning);
+            assert!(!warned.is_empty(), "{tag} {args:?}: {warning}");
+            assert!(warned.iter().all(|code| checked.contains(code)), "{tag} {args:?}: {warning}\n{checked:?}");
+            assert_eq!(warning.contains("own line"), stuck, "{tag} {args:?}: {warning}");
+            assert!(warning.contains("disable"), "{tag} {args:?}: {warning}");
+            printed.push(warning.clone());
+        }
+        assert_eq!(printed[0], printed[1], "{tag}");
+    }
 }
 
 #[test]
@@ -372,9 +443,19 @@ fn fix_warns_about_am02_and_cp02_only_with_the_dialects_where_their_fix_can_chan
     }
 }
 
+/// Whether `help` has a line that starts with each of the exit `codes`.
+fn lists_exit_codes(help: &str, codes: &[&str]) -> bool {
+    codes.iter().all(|code| help.lines().any(|l| l.split_whitespace().next() == Some(code)))
+}
+
 #[test]
-fn every_command_help_describes_the_paths_and_lists_its_exit_codes() {
+fn every_command_help_describes_the_paths_and_the_config_and_lists_its_exit_codes() {
     let p = Project::new("help", CV05, CLEAN);
+    let top = p.command().arg("--help").output().unwrap();
+    assert_eq!(top.status.code(), Some(0), "{}", stderr(&top));
+    let help = String::from_utf8_lossy(&top.stdout).into_owned();
+    assert!(lists_exit_codes(&help, &["0", "1", "2"]), "{help}");
+
     for (command, codes) in [("check", &["0", "1", "2"][..]), ("fix", &["0", "1", "2"]), ("list", &["0", "2"]), ("dump", &["0", "2"])] {
         let out = p.command().args([command, "--help"]).output().unwrap();
         assert_eq!(out.status.code(), Some(0), "{command}: {}", stderr(&out));
@@ -387,9 +468,17 @@ fn every_command_help_describes_the_paths_and_lists_its_exit_codes() {
             .collect();
         let description = arguments.replace("[PATHS]...", "");
         assert!(!description.trim().is_empty(), "{command}: {help}");
-        for code in codes {
-            assert!(help.lines().any(|l| l.split_whitespace().next() == Some(code)), "{command} {code}: {help}");
-        }
+        assert!(lists_exit_codes(&help, codes), "{command}: {help}");
+
+        // Terms are matched across the line breaks of the help.
+        let words = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        let config = words.split_once("--config").and_then(|(_, rest)| rest.split(" --").next()).unwrap_or_default();
+        assert!(config.contains("current directory"), "{command}: {help}");
+        assert!(config.contains("[sqlx-sqruff]"), "{command}: {help}");
+        let fix = command == "fix";
+        assert_eq!(words.contains("cannot be written"), fix, "{command}: {help}");
+        // The README section name that a user searches for.
+        assert_eq!(words.contains("Fixes that can change a query"), fix, "{command}: {help}");
     }
 }
 
