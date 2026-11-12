@@ -267,18 +267,29 @@ impl Visitor {
     /// the tokens of another macro.
     fn visit_macro_call(&mut self, leading_colon: bool, segments: &[String], tokens: TokenStream) {
         if let Some(name) = self.query_name(leading_colon, segments, Namespace::Macro) {
-            if let Some(lit) = sql_literal(tokens, name) {
+            let tokens: Vec<TokenTree> = tokens.into_iter().collect();
+            if let Some(lit) = sql_literal(&tokens, name) {
                 self.found.push(lit);
             }
+            // The bind arguments can hold queries too. Visiting the SQL literal
+            // as an expression finds nothing, so it is not found twice.
+            self.visit_arguments(after_record_type(&tokens, name));
         } else if !leading_colon && segments == ["macro_rules"] {
             if self.may_name_a_query(&tokens) {
                 let outer = std::mem::replace(&mut self.in_macro_rules, true);
                 self.scan(tokens);
                 self.in_macro_rules = outer;
             }
-        } else if let Ok(args) = Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated.parse2(tokens.clone()) {
-            // Most macros (`assert!`, `vec!`, `tokio::try_join!`, ...) take
-            // expressions, which can hold queries.
+        } else {
+            self.visit_arguments(tokens);
+        }
+    }
+
+    /// Visit the arguments of a macro. Most macros (`assert!`, `vec!`,
+    /// `tokio::try_join!`, ...) take expressions, which can hold queries; the
+    /// tokens of any other macro are searched.
+    fn visit_arguments(&mut self, tokens: TokenStream) {
+        if let Ok(args) = Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated.parse2(tokens.clone()) {
             for arg in &args {
                 self.visit_expr(arg);
             }
@@ -673,19 +684,28 @@ fn is_str_literal(tt: &TokenTree) -> bool {
 /// argument, or for `query_as!` its second, after the record type. `None` when
 /// that argument is not a single string literal: sqlx joins literals written
 /// with `+`, and rewriting one of them alone can break the query.
-fn sql_literal(tokens: TokenStream, name: &str) -> Option<Literal> {
-    let tokens: Vec<TokenTree> = tokens.into_iter().collect();
+fn sql_literal(tokens: &[TokenTree], name: &str) -> Option<Literal> {
+    argument_literal(&tokens[record_type_len(tokens, name)?..])
+}
+
+/// The arguments of a call to the sqlx query macro `name` without the record
+/// type that `query_as!` takes first, which is not an expression. All the
+/// tokens when there is no record type or it does not parse as one.
+fn after_record_type(tokens: &[TokenTree], name: &str) -> TokenStream {
+    tokens[record_type_len(tokens, name).unwrap_or(0)..].iter().cloned().collect()
+}
+
+/// The number of tokens that the record type of a call to the sqlx query macro
+/// `name` takes, with the comma after it: `0` for a macro without one, and
+/// `None` when no tokens before a comma are one type.
+fn record_type_len(tokens: &[TokenTree], name: &str) -> Option<usize> {
     if !RECORD_TYPE_MACROS.contains(&name) {
-        return argument_literal(&tokens);
+        return Some(0);
     }
-    // The record type can hold commas (`Pair<A, B>`), so take the first string
-    // literal, and check that all before its comma is one type.
-    let at = tokens.iter().position(is_str_literal)?;
-    let comma = at.checked_sub(1)?;
-    if !is_punct(&tokens[comma], ',') || !is_type(&tokens[..comma]) {
-        return None;
-    }
-    argument_literal(&tokens[at..])
+    // The record type can hold commas (`Pair<A, B>`), so it ends at the first
+    // comma that all the tokens before it form one type with.
+    let comma = (0..tokens.len()).find(|&at| is_punct(&tokens[at], ',') && is_type(&tokens[..at]))?;
+    Some(comma + 1)
 }
 
 /// The string literal that is the whole first argument in `tokens`.
@@ -1168,6 +1188,76 @@ fn f() {
 }
 "###;
         assert_eq!(texts(src), ["\"SELECT 1\"", "\"SELECT 2\"", "\"SELECT 3\""]);
+    }
+
+    #[test]
+    fn finds_queries_in_the_arguments_of_a_query_macro() {
+        let src = r###"
+async fn f(c: &mut sqlx::PgConnection) -> sqlx::Result<()> {
+    sqlx::query!(
+        "UPDATE t SET a = $1",
+        sqlx::query_scalar!("SELECT max(a) FROM t LIMIT 1").fetch_one(&mut *c).await?
+    )
+    .execute(&mut *c)
+    .await?;
+    sqlx::query("UPDATE t SET a = $1")
+        .bind(sqlx::query_scalar!("SELECT max(a) FROM t LIMIT 1").fetch_one(&mut *c).await?)
+        .execute(&mut *c)
+        .await?;
+    Ok(())
+}
+"###;
+        let found = extract(src);
+        let lines: Vec<usize> = found.iter().map(|q| q.line).collect();
+        assert_eq!(lines, [4, 5, 9, 10]);
+        for q in &found {
+            assert_eq!(&src[q.start_byte..q.end_byte], q.text);
+        }
+    }
+
+    #[test]
+    fn a_query_macro_visits_its_other_arguments_with_the_same_rules() {
+        let src = r###"
+use sqlx::query;
+fn f(x: u8) {
+    let _ = sqlx::query_as!(Row, "SELECT 1", sqlx::query!("SELECT 2"));
+    let _ = sqlx::query_as!(Pair<A, B>, "SELECT 3", query("SELECT 4"));
+    let _ = sqlx::query!("SELECT 5", { sqlx::query("SELECT 6"); 1 });
+    let _ = sqlx::query_scalar!(SQL, sqlx::query("SELECT 7"));
+    let query = |s: &str| s;
+    let _ = sqlx::query!("SELECT 8", query("not sql 9"), "not sql 10");
+}
+fn g() {
+    let _ = sqlx::query_as!(Vec<Row>, "SELECT 11", |query: F| query("not sql 12"));
+}
+macro_rules! m {
+    ($sql:literal) => { sqlx::query!($sql, sqlx::query_scalar!("SELECT 13")) };
+    ($t:ty) => { sqlx::query_as!($t, "SELECT 14", sqlx::query("SELECT 15")) };
+}
+"###;
+        let found = extract(src);
+        let texts: Vec<&str> = found.iter().map(|q| q.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "\"SELECT 1\"",
+                "\"SELECT 2\"",
+                "\"SELECT 3\"",
+                "\"SELECT 4\"",
+                "\"SELECT 5\"",
+                "\"SELECT 6\"",
+                "\"SELECT 7\"",
+                "\"SELECT 8\"",
+                "\"SELECT 11\"",
+                "\"SELECT 13\"",
+                "\"SELECT 14\"",
+                "\"SELECT 15\"",
+            ]
+        );
+        for q in &found {
+            assert_eq!(&src[q.start_byte..q.end_byte], q.text);
+            assert_eq!(src[..q.start_byte].matches('\n').count() + 1, q.line);
+        }
     }
 
     #[test]
