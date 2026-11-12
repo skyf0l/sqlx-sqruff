@@ -110,10 +110,12 @@ keep it on one line.
 `fix` leaves a query unchanged, warns about it, and counts it as not applied
 (so `fix --check` fails) when:
 
-- sqruff cannot fully parse its SQL with the configured dialect, or one of
-  sqruff's rules failed on it (an `INTERNAL` finding), because a fix computed
-  from a partial parse may change what the query does. Check the dialect, or
-  the SQL.
+- sqruff wants to change it but cannot fully parse its SQL with the
+  configured dialect, or one of sqruff's rules failed on it (an `INTERNAL`
+  finding), because a fix computed from a partial parse may change what the
+  query does. Check the dialect, or the SQL. A query that sqruff cannot parse
+  but would not change is not counted, so `fix --check` passes it; `check`
+  reports its `PARSE` or `LEX` finding and exits `1`.
 - sqruff's fix needs a different line layout than the literal has, for example
   a line break inside a one-line literal. Write the query as a multi-line raw
   string (`r#"`...`"#`), or disable the rule.
@@ -140,6 +142,9 @@ an error instead of being replaced.
 `check` prints one line per finding: `path:line:col: CODE message`. With
 `--format jsonl`, it prints one JSON object per line instead (JSON Lines), with
 the keys `file`, `line`, `col` (1-based, in characters), `code` and `message`.
+`message` is sqruff's, except that a line number it quotes from the SQL (as in
+`AL08`'s `Reuse of column alias 'a' from line 6.`) is given as the line of the
+`.rs` file, like `line`.
 
 `CODE` is the sqruff rule code (`CP01`, `LT01`, ...), or one of these codes for
 a finding that is not a rule violation:

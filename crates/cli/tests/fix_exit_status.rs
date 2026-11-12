@@ -119,6 +119,33 @@ fn list_and_dump_report_a_file_that_does_not_parse_as_an_error() {
 }
 
 #[test]
+fn whitespace_only_lines_reach_dump_and_check_as_written_at_any_depth() {
+    let blank = ["    ", "\t  ", "        ", "            "];
+    let lines = blank.join("\n");
+    let src = format!(
+        "fn f() {{\n    let _ = sqlx::query!(\n        r#\"\n        SELECT 'a\n{lines}\n        b' AS c\n        FROM t\n        \"#\n    );\n    let _ = sqlx::query!(\n        r#\"\n        SELECT a\n{lines}\n        FROM t\n        \"#\n    );\n}}\n"
+    );
+    let p = Project::new("blank_lines", "[sqruff]\ndialect = postgres\nrules = LT01\n", &src);
+
+    let dump = p.run(&["dump"]);
+    assert_eq!(dump.status.code(), Some(0), "{}", stderr(&dump));
+    let stdout = String::from_utf8_lossy(&dump.stdout).into_owned();
+    for line in blank {
+        assert_eq!(stdout.lines().filter(|l| l == &line).count(), 2, "{line:?} in:\n{stdout:?}");
+    }
+
+    // The second query's whitespace-only lines are outside a string value, on
+    // `.rs` lines 16 to 19.
+    let check = p.run(&["check"]);
+    let findings = String::from_utf8_lossy(&check.stdout).into_owned();
+    for line in 16..=19 {
+        let at = format!("{FILE}:{line}:");
+        assert!(findings.lines().any(|l| l.starts_with(&at) && l.contains("LT01")), "{at} in:\n{findings}");
+    }
+    assert_eq!(findings.lines().count(), 4, "{findings}");
+}
+
+#[test]
 fn a_query_split_into_literals_joined_with_plus_is_skipped_by_every_command() {
     let src = "fn f() {\n    let _ = sqlx::query!(\"SELECT  id \" + \"FROM users WHERE id = $1\", 1);\n}\n";
     let p = Project::new("plus", "[sqruff]\ndialect = postgres\nrules = LT01,CV05\n", src);
@@ -194,6 +221,26 @@ fn sql_that_does_not_parse_is_not_rewritten_and_fails_fix_check() {
 
     let fix = p.run(&["fix"]);
     assert_eq!(fix.status.code(), Some(0), "{}", stderr(&fix));
+    assert_eq!(p.src(), src);
+}
+
+#[test]
+fn sql_that_does_not_parse_but_needs_no_fix_fails_check_and_passes_fix_check() {
+    // `fix --check` reports what `fix` would change or could not change, and
+    // no rule changes this query; `check` is what reports the parse error.
+    let src = "fn f() {\n    let _ = sqlx::query(\"SELECT FROM WHERE ((\");\n}\n";
+    let p = Project::new("unparsable_no_fix", CV05, src);
+
+    let check = p.run(&["check"]);
+    assert_eq!(check.status.code(), Some(1), "{}", stderr(&check));
+    let at = format!("{FILE}:2:");
+    let findings = String::from_utf8_lossy(&check.stdout).into_owned();
+    assert!(findings.lines().any(|l| l.starts_with(&at) && l.split_whitespace().nth(1) == Some("PARSE")), "{findings}");
+
+    let fix_check = p.run(&["fix", "--check"]);
+    assert_eq!(fix_check.status.code(), Some(0), "{}", stderr(&fix_check));
+    assert_eq!(not_applied_count(&fix_check), 0, "{}", stderr(&fix_check));
+    assert!(lines_naming(&fix_check, 2).is_empty(), "{}", stderr(&fix_check));
     assert_eq!(p.src(), src);
 }
 

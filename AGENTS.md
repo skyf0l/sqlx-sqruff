@@ -61,8 +61,10 @@ covered by tests:
   inside multi-line SQL string constants. The `LintView` indentation removal and
   the re-indentation in `engine.rs` must stay exact inverses.
 - A literal is not rewritten, and is reported as not applied, when:
-  - sqruff could not fully parse its SQL (a fix built on a wrong parse can change
-    what the query does);
+  - sqruff would change it but could not fully parse its SQL (a fix built on a
+    wrong parse can change what the query does). An unparsable query that
+    sqruff would not change is not counted: `fix --check` answers whether `fix`
+    has work it would do or could not do, and `check` reports parse errors;
   - it is a normal string using escapes other than `\"` and `\\`;
   - sqruff's change needs a different line layout (one-line literals stay on one
     line);
@@ -99,6 +101,9 @@ Before changing any of these, run the tool on a copy of a real sqlx codebase
   same code, so `code()` in `sqruff_adapter.rs` tells them apart by the start of
   sqruff's messages. Re-check those messages when upgrading sqruff. An
   unrecognised message falls back to `PARSE`, which blocks `fix`.
+- `Finding::message` in `sqruff_adapter.rs` rewrites the SQL line number that
+  `AL08`'s message quotes into the `.rs` line. When upgrading sqruff, search
+  its rules for other messages that quote a position and add them there.
 
 ## Tests
 

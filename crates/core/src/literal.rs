@@ -428,6 +428,25 @@ mod tests {
     }
 
     #[test]
+    fn lint_view_keeps_whitespace_only_lines_shallower_than_the_indent() {
+        let blank = ["    ", "\t  ", "        ", "            "];
+        let lines = blank.join("\n");
+        for (c, indent) in [
+            (format!("\n        SELECT 'a\n{lines}\n        b' AS c\n        FROM t\n    "), "        "),
+            (format!("SELECT 'a\n{lines}\n        b' AS c\n        FROM t"), "        "),
+        ] {
+            let view = LintView::new(&c);
+            assert_eq!(view.indent, indent, "{c:?}");
+            let sql: Vec<&str> = view.sql.lines().collect();
+            assert_eq!(sql[1..5], blank, "{c:?}");
+            for (n, line) in blank.iter().enumerate() {
+                let at = c.find(&format!("\n{line}\n")).unwrap() + 1;
+                assert_eq!(view.content_index(n + 2, 1), at, "{c:?}");
+            }
+        }
+    }
+
+    #[test]
     fn reindenting_the_lint_view_restores_the_content() {
         for c in [
             "\n        SELECT 'a\n          \n            b' AS c\n        FROM t\n    ",
@@ -438,6 +457,7 @@ mod tests {
             "\n        SELECT 'a\n        \n   \n  \n          \n\n        b' AS c\n        ",
             "SELECT 'a\n        \n   \n  \n          \n\n        b' AS c\n        FROM t",
             "\n\n        \n        SELECT 1\n",
+            "\n        SELECT 'a\n    \n\t  \n        \n            \n        b' AS c\n    ",
         ] {
             let view = LintView::new(c);
             let (leading, trailing) = framing(c);
