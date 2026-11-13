@@ -764,7 +764,7 @@ dependencies = [
 
 [[package]]
 name = "sqlx-sqruff"
-version = "1.0.0-rc.2"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -775,7 +775,7 @@ dependencies = [
 
 [[package]]
 name = "sqlx-sqruff-core"
-version = "1.0.0-rc.2"
+version = "1.0.0"
 dependencies = [
  "proc-macro2",
  "serde_json",
