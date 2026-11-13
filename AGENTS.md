@@ -1,8 +1,9 @@
 # AGENTS.md
 
 Guidance for coding agents working on this repository. The user-facing behaviour
-is documented in `README.md`; read its Usage and Known limitations sections
-before changing behaviour, and update them in the same change.
+is documented in `README.md` and in `docs/`; read `docs/usage.md` and
+`docs/limitations.md` before changing behaviour, and update them, and the
+README's summary of them, in the same change.
 
 ## Layout
 
@@ -32,10 +33,10 @@ before changing behaviour, and update them in the same change.
   them, so the `error:` lines are in path order too. Missing named paths are
   reported, sorted, before any work, and stop the run.
 
-The output formats, finding codes, path spelling and output order in the
-README's Output section are promises to users' scripts: change them only on
-purpose, and update that section and the tests in
-`crates/cli/tests/output_format.rs` with them.
+The output formats, finding codes, path spelling and output order in
+`docs/output.md` are promises to users' scripts: change them only on purpose,
+and update that file and the tests in `crates/cli/tests/output_format.rs` with
+them.
 
 ## Gates
 
@@ -147,7 +148,7 @@ Before changing any of these, run the tool on a copy of a real sqlx codebase
   breaking change to a public item of `sqlx-sqruff-core` needs a new major
   version.
 - Every release publishes both crates, so the version must be new for both. The steps
-  are in the README's Releasing section; the `Release` workflow checks the tag,
+  are in `docs/releasing.md`; the `Release` workflow checks the tag,
   the branch and both versions before publishing.
 - `rust-version` (MSRV) is 1.95, because sqruff uses an API stabilised in that
   release. Keep it in sync with the `msrv` job in `.github/workflows/ci.yml`, and
