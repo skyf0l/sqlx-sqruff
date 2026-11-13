@@ -1,37 +1,31 @@
 # sqlx-sqruff
 
-Lint and auto-format the SQL embedded inside `sqlx::query*!` macros and
-`sqlx::query*("...")` calls in Rust source, by embedding the [`sqruff`](https://github.com/quarylabs/sqruff) library
-in-process.
+[![sqlx-sqruff on crates.io](https://img.shields.io/crates/v/sqlx-sqruff?label=sqlx-sqruff)](https://crates.io/crates/sqlx-sqruff)
+[![sqlx-sqruff-core on crates.io](https://img.shields.io/crates/v/sqlx-sqruff-core?label=sqlx-sqruff-core)](https://crates.io/crates/sqlx-sqruff-core)
+[![docs.rs](https://img.shields.io/docsrs/sqlx-sqruff-core)](https://docs.rs/sqlx-sqruff-core)
+[![License: MIT OR Apache-2.0](https://img.shields.io/crates/l/sqlx-sqruff)](#license)
 
-## Why
+Lint and format the SQL inside your sqlx queries.
 
-When you write SQL with [`sqlx`](https://github.com/launchbadge/sqlx), it lives
-inside `sqlx::query!` macros or `sqlx::query("...")` calls as Rust string
-literals, invisible to every SQL
-formatter and linter you already use. Tools like sqruff, sqlfluff, or
-pgFormatter only ever see `.sql` files, so the SQL embedded in your Rust code
-never gets formatted or checked: keyword casing drifts, indentation rots, and
-dead-code patterns slip past review.
+With [`sqlx`](https://github.com/launchbadge/sqlx), your SQL lives in Rust
+string literals. SQL tools such as sqruff, sqlfluff or pgFormatter only read
+`.sql` files, so they never see it: keyword case drifts, indentation rots, and
+mistakes such as unused CTEs and joins, `LIMIT` without `ORDER BY`, or a
+redundant `CASE` / `ELSE NULL` slip past review. `sqlx-sqruff` finds the SQL in
+your `sqlx::query*!` macros and `sqlx::query*("...")` calls, checks it with the
+[`sqruff`](https://github.com/quarylabs/sqruff) SQL linter, and writes the fixed
+SQL back into your `.rs` files.
 
-`sqlx-sqruff` closes that gap. It finds the SQL inside your `query!` macros
-and `query("...")` calls, runs a real SQL linter/formatter over it, and writes the cleaned-up SQL back
-into your `.rs` files, so your inline queries get the same consistency and
-checks as standalone `.sql` files.
+- **Your rules.** It reads your project's `.sqruff`; it has no presets of its own.
+- **Postgres-correct by default.** It understands sqlx casts such as
+  `as "col!: Type"`, which SQL tools that default to the `ansi` dialect misread.
+  Any sqruff dialect works.
+- **Fast and built for CI.** sqruff runs in the same process, not as a
+  subprocess for each file. Findings are reported at `file:line:col`, as text
+  or JSON Lines, with a non-zero exit code.
 
-- **One formatter for all your SQL.** Inline sqlx SQL is formatted
-  and linted just like your `.sql` files: consistent keyword casing, indentation
-  and layout, applied automatically with `fix`.
-- **Catches real problems.** Unused CTEs and joins, `LIMIT` without
-  `ORDER BY`, redundant `CASE` / `ELSE NULL`, and more, surfaced right inside
-  your Rust source at `file:line:col` (human or JSON Lines output).
-- **Postgres-correct out of the box.** Understands sqlx-specific casts like
-  `as "col!: Type"` that trip up ansi-default SQL tooling (any dialect via
-  `--dialect`).
-- **Fast and CI-friendly.** Embeds the `sqruff` library in-process (no
-  subprocess per file) and ships a `--check` gate for pipelines.
-- **Your rules, not ours.** Configured by your project's `.sqruff`; the tool
-  embeds no presets of its own.
+This README follows the steps of adopting the tool. The full reference is in
+the [documentation](#documentation).
 
 ## Install
 
@@ -45,129 +39,153 @@ Windows aarch64) are attached to each
 [GitHub release](https://github.com/skyf0l/sqlx-sqruff/releases), with a
 `.sha256` checksum next to each archive.
 
-## Usage
+## Check your queries
 
-```bash
-sqlx-sqruff check  [PATHS...]              # lint, non-zero on findings
-sqlx-sqruff check  [PATHS...] --format jsonl  # one JSON object per finding (JSON Lines)
-sqlx-sqruff fix    [PATHS...]              # apply fixes, write back
-sqlx-sqruff fix    [PATHS...] --check      # CI gate, no writes, shows each change
-sqlx-sqruff list   [PATHS...]              # debug: list extracted queries
-sqlx-sqruff dump   [PATHS...]              # debug: print each query's SQL as the linter sees it
+Add a `.sqruff` file at your project root. It is sqruff's own config file, and
+your project owns and version-controls it:
+
+```ini
+[sqruff]
+dialect = postgres
 ```
 
-Shared flags on `check` / `fix`:
+Then run `check` from the project root. It scans every `.rs` file under the
+current directory, or under the paths you name (`sqlx-sqruff check src tests`),
+and prints one line per finding:
 
-- `--config FILE`: an extra sqruff config file, applied on top of the config
-  that sqruff discovers from the current directory (it does not replace it;
-  see [Config resolution](#config-resolution)). Its `[sqlx-sqruff]` section,
-  when it has one, also selects the files (see
-  [Selecting which files to scan](#selecting-which-files-to-scan)).
-- `--dialect NAME`: SQL dialect, overriding the config's `dialect` (see
-  [Config resolution](#config-resolution)).
+```text
+$ sqlx-sqruff check
+src/db.rs:2:42: CP01 Keywords must be consistently upper case.
+src/db.rs:2:65: LT01 Expected only single space before "ORDER". Found "   ".
+src/db.rs:12:9: LT02 Line should not be indented.
+3 finding(s); 0 error(s).
+```
 
-`list` and `dump` do not lint, so they take only `--config`, and only for the
-file selection in its `[sqlx-sqruff]` section (see
-[Selecting which files to scan](#selecting-which-files-to-scan)). Passing
-`--dialect` to them is an argument error (exit `2`).
+`--format jsonl` prints one JSON object per finding instead, with the keys
+`file`, `line`, `col`, `code` and `message`. The rule codes are sqruff's; see
+its [rules reference](https://playground.quary.dev/docs/reference/rules/). The
+exact output format is in
+[docs/output.md](https://github.com/skyf0l/sqlx-sqruff/blob/main/docs/output.md).
 
-With `--check`, `fix` prints, for each file it would change, a
-`would fix N query(ies) in <path>` line, then each query it would change: its
-`path:line`, the current literal with every line prefixed by `- `, then the
-fixed literal with every line prefixed by `+ `. Without `--check`, it prints a
-`fixed N query(ies) in <path>` line for each file it writes.
+## Fix them
 
-`check` prints one line per finding, `path:line:col: CODE message`, or with
-`--format jsonl` one JSON object per finding; see [Output](#output).
+`fix --check` shows what `fix` would change, without writing anything:
 
-Exit codes:
+```text
+$ sqlx-sqruff fix --check
+would fix 2 query(ies) in src/db.rs
+src/db.rs:2
+- "SELECT name from users WHERE active   ORDER BY name"
++ "SELECT name FROM users WHERE active ORDER BY name"
+src/db.rs:10
+- r#"
+-         SELECT t.name FROM teams AS t
+-           JOIN users AS u ON u.team_id = t.id
+-         "#
++ r#"
++         SELECT t.name FROM teams AS t
++         JOIN users AS u ON u.team_id = t.id
++         "#
+2 query(ies) in 1 file(s); 0 not applied; 0 error(s).
+```
 
-- `check` exits `1` when there are findings, `0` otherwise.
-- `fix --check` exits `1` when a file would change or when a needed change could
-  not be applied, `0` otherwise. Plain `fix` prints a warning for each change it
-  could not apply, and still exits `0`.
-- Every command exits `2` on errors:
-  - a path given on the command line that does not exist. This is checked
-    before any work: each missing path is named, and the run stops there,
-    without a summary.
-  - a path that selects no file to scan, so that a CI step cannot pass while
-    checking nothing. Every directory you name must hold at least one `.rs`
-    file that the [file selection](#selecting-which-files-to-scan) keeps; one
-    that does not (for example an empty directory, or one whose files
-    `exclude` or `.gitignore` prune) is named on an
-    `error: <path>: no Rust files found` line, or, when the directory cannot be
-    read, on a line that gives the reading error instead. With no path named, the same
-    applies to the current directory; when an `include` matches nothing, the
-    error names the config file and the directory its patterns are relative
-    to.
-  - a file or directory that cannot be read (for example a file that is not
-    UTF-8), a file that is not valid Rust, or a fixed file that cannot be
-    written. A file you name on the command line is always parsed as Rust; a
-    file found by walking a directory is parsed only when it contains the text
-    `query`, so one without it is never reported as invalid Rust (see
-    *Unparsable Rust is an error for the whole file* under
-    [Known limitations](#known-limitations)). Each such path is named on one
-    `error: <path>: ...` line (`error: <path>:<line>:<col>: ...` for a file
-    that is not valid Rust).
+`sqlx-sqruff fix` then writes those changes into the files. It keeps the line
+shape of each literal: a one-line query stays on one line, and a multi-line raw
+string keeps its block layout. To have a query laid out as a block, write it
+across several lines in a raw string (`r#"`...`"#`) and run `fix` again.
 
-  For the last two kinds of errors, the run goes on with the other paths and
-  files, `check` and `fix` still print their summary, which counts the
-  errors, and the exit code is `2` at the end.
-  - an invalid config, such as an unknown dialect, a `--config` file that
-    cannot be read, or an invalid value in the `[sqlx-sqruff]` section.
-  - an invalid argument, such as an unknown flag.
+Each file is written through a temporary file in the same directory, so an
+interrupted run never leaves a half-written file. When `fix` cannot apply a
+change safely, it leaves the query as it is and warns; see
+[When `fix` leaves a query unchanged](#when-fix-leaves-a-query-unchanged).
 
-`fix` cleans every query in place and **preserves each literal's line-shape**:
-one-liners stay on one line, multi-line raw blocks keep block layout. Line-shape
-is yours to choose. To opt a query into block formatting, write it across
-multiple lines in a raw string (`r#"`...`"#`) and re-run `fix`; to keep it compact,
-keep it on one line.
+## Add it to CI
 
-`fix` leaves a query unchanged, warns about it, and counts it as not applied
-(so `fix --check` fails) when:
+Install the tool with one of the commands above, then run either command from
+the project root:
 
-- sqruff wants to change it but cannot fully parse its SQL with the
-  configured dialect, or one of sqruff's rules failed on it (an `INTERNAL`
-  finding), because a fix computed from a partial parse may change what the
-  query does. Check the dialect, or the SQL. A query that sqruff cannot parse
-  but would not change is not counted, so `fix --check` passes it; `check`
-  reports its `PARSE` or `LEX` finding and exits `1`.
-- sqruff's fix needs a different line layout than the literal has, for example
-  a line break inside a one-line literal. Write the query as a multi-line raw
-  string (`r#"`...`"#`), or disable the rule.
-- fixing the rewritten query again would change it further, so `fix` would
-  rewrite it on every run. When the SQL starts right after the opening quote
-  and continues on more lines of SQL, a layout rule can grow the indent of
-  those lines on every run, and the warning says to start the SQL on its own
-  line (see *Nested indentation needs block layout* under
-  [Known limitations](#known-limitations)). Otherwise sqruff's own fixes do
-  not settle on the query, for example when `ST09` swaps a join condition back
-  and forth, or when `LT05` and `LT09` undo each other's change with a short
-  `max_line_length`; the warning then says to disable one of the rules it
-  names.
+```bash
+sqlx-sqruff check        # fails on any finding, including those fix cannot fix
+sqlx-sqruff fix --check  # fails when fix would change a file, and shows the change
+```
 
-After rewriting a query, and before writing the file, `fix` lints and fixes the
-rewritten query again. When sqruff cannot fully parse the rewritten SQL, or one
-of its rules fails on it, the rewrite is not written: `fix` warns that the
-fixed SQL no longer parses and counts the query as not applied. When sqruff
-still reports a finding there, because part
-of its fix needs a different line layout (for example the line breaks that
-`LT05` or `LT09` add to a one-line query), `fix` writes the part that fits,
-warns that the rest was not applied, and counts the query as not applied.
+| Exit code | Meaning |
+| --------- | ------- |
+| `0` | No findings, nothing to change, and no error. |
+| `1` | `check`: one or more findings. `fix --check`: a file would change, or a needed change cannot be applied. |
+| `2` | An error, each reported on an `error:` line. |
 
-The warnings about a line layout, and about a query that fixing again would
-change, name the rules whose fix was not applied: the fixable
-rules that `check` reports on the query as it stays in the file, which is the
-rewritten query when `fix` wrote part of its change and the original query
-when `fix` left it unchanged. A later `fix --check` or `check` reports the same
-queries and rules; `check` also reports the findings that sqruff cannot fix,
-which no warning names.
+A path that selects no `.rs` file is an error, so a CI step cannot pass while
+checking nothing. Plain `fix` exits `0` even when it could not apply a change,
+and warns about each one instead. All the errors are listed in
+[docs/output.md](https://github.com/skyf0l/sqlx-sqruff/blob/main/docs/output.md#errors).
 
-`fix` writes each changed file through a temporary file in the same directory
-that then replaces the original, so an interrupted run never leaves a
-half-written file. The file keeps its permissions, a file named through a
-symbolic link is written through the link, and a read-only file is reported as
-an error instead of being replaced.
+## Configure the rules
+
+The rules and the `.sqruff` format are sqruff's; see its
+[configuration docs](https://playground.quary.dev/docs/usage/configuration/).
+Like sqruff, the tool stacks every config file it finds in your user config
+directory, your home directory, and the current directory and its parents. The
+lookup starts from the current directory, not from the files being checked.
+
+- `--config FILE` adds a config file on top of the ones found; it does not
+  replace them.
+- The dialect is `--dialect NAME`, else the `dialect` in the config, else
+  `postgres`. For MySQL or SQLite (`?` placeholders), set `dialect` in your
+  `.sqruff`.
+- When no config sets any sqruff option, sqruff's built-in default rules apply,
+  and `check` and `fix` print a `note:` line saying so.
+
+The exact lookup order is in
+[docs/configuration.md](https://github.com/skyf0l/sqlx-sqruff/blob/main/docs/configuration.md#config-resolution).
+
+## Choose which files to scan
+
+By default, every `.rs` file under the paths you name (or the current
+directory) is scanned, except hidden files and what `.gitignore` and the other
+ignore files exclude. To set the scope for the whole project, add a
+`[sqlx-sqruff]` section to your `.sqruff`. sqruff ignores it; only this tool
+reads it:
+
+```ini
+[sqlx-sqruff]
+include = src/**/*.rs, crates/**/*.rs
+exclude = **/generated/**
+```
+
+Globs are gitignore-style and relative to the config file's directory. Paths
+you name on the command line replace `include`; `exclude` and `.gitignore`
+still prune what is found inside them, and a file you name is always scanned.
+The other keys and rules are in
+[docs/configuration.md](https://github.com/skyf0l/sqlx-sqruff/blob/main/docs/configuration.md#selecting-which-files-to-scan).
+
+## When a finding stays
+
+### Skip a query with `noqa`
+
+sqruff's inline `noqa` comments work inside the SQL: end a line with `-- noqa`
+to silence every rule on that line, or with `-- noqa: CV05` for one rule. A
+comment that names a rule sqruff does not know, such as a misspelt one, is not
+reported and silences nothing.
+
+### When `fix` leaves a query unchanged
+
+`fix` writes a change only when it is safe. Otherwise it leaves the query as it
+is (or writes only the part of the fix that fits the literal's line layout),
+prints a `warning:` or `note:` line, and counts the query as not applied, so
+`fix --check` fails. This happens when:
+
+- sqruff cannot fully parse the SQL, or one of its rules fails on it: check the
+  dialect, or the SQL.
+- The fix needs a different line layout, such as a line break in a one-line
+  literal: write the query as a multi-line raw string, or disable the rule.
+- Fixing the result again would change it further: start the SQL on its own
+  line after the opening quote, or disable one of the rules the warning names.
+- The literal is a normal string with escapes other than `\"` and `\\`: write
+  it as a raw string (`r#"..."#`).
+
+The details are in
+[docs/usage.md](https://github.com/skyf0l/sqlx-sqruff/blob/main/docs/usage.md#when-fix-leaves-a-query-unchanged).
 
 ### Fixes that can change a query
 
@@ -188,8 +206,7 @@ sqruff runs it on, and `CP02` only with `mysql` or `mariadb`. `check` does not
 warn, because it changes nothing.
 
 Review the changes that `fix --check` shows, or that `fix` made, before you
-commit them. To keep such a rule for `check` but not for `fix`, run `fix` with
-an extra config that excludes it, for example
+commit them. To keep such a rule for `check` but not for `fix`, run
 `sqlx-sqruff fix --config fix.sqruff` with this `fix.sqruff`:
 
 ```ini
@@ -200,348 +217,61 @@ exclude_rules = ST06,ST07
 `--config` overrides the same key of the discovered config, so also list the
 rules your project's config already excludes.
 
-### Output
+### Queries that are not checked
 
-`check` prints one line per finding: `path:line:col: CODE message`. With
-`--format jsonl`, it prints one JSON object per line instead (JSON Lines), with
-the keys `file`, `line`, `col` (1-based, in characters), `code` and `message`.
-`message` is sqruff's, except that a line number it quotes from the SQL (as in
-`AL08`'s `Reuse of column alias 'a' from line 6.`) is given as the line of the
-`.rs` file, like `line`.
+- Only these are read: the `query!`, `query_as!` and `query_scalar!` macros and
+  their `_unchecked` variants, and the `query`, `query_as` and `query_scalar`
+  functions and their `_with` variants. `sqlx::raw_sql`, `QueryBuilder` and SQL
+  passed straight to an executor method such as `.execute("...")` are not.
+- The SQL must be one string literal written in the call. A query built with
+  `+`, `concat!`, a `const`, a variable or `format!` is skipped without a
+  warning.
+- A bare `query!(...)` or `query("...")`, without `sqlx::`, counts only when the
+  name is imported from sqlx (`use sqlx::query;`) in the same module or an
+  enclosing block.
+- Queries whose SQL starts with `SET` are skipped.
+- A file that is not valid Rust is an error, and none of its queries are read.
 
-`CODE` is the sqruff rule code (`CP01`, `LT01`, ...), or one of these codes for
-a finding that is not a rule violation:
+`sqlx-sqruff list` prints every query the tool found, and `sqlx-sqruff dump`
+prints each query's SQL as the linter sees it. All the rules, including crate
+aliases, re-exports and macros, are in
+[docs/limitations.md](https://github.com/skyf0l/sqlx-sqruff/blob/main/docs/limitations.md).
 
-| Code | Meaning |
-| ---- | ------- |
-| `PARSE` | sqruff could not parse the SQL with the configured dialect. |
-| `LEX` | sqruff could not split the SQL into tokens, for example at an unclosed quote. sqruff then also reports `PARSE` at the same place. |
-| `NOQA` | a `-- noqa` comment that sqruff reports as malformed: `noqa` followed by something other than `:` (such as `-- noqa?` or `-- noqa CV05`), or `-- noqa:` with nothing after the colon. A comment that names no rule sqruff knows, such as `-- noqa:disable` (without `=`) or `-- noqa: foo=CV05`, is accepted without a finding and silences nothing. When sqruff's `warn_unused_ignores = True` is set, every `noqa` comment that silences nothing is reported too, those included. |
-| `INTERNAL` | sqruff failed on the query, for example on an invalid inline `-- sqruff:` config line, or one of its rules failed. The message says why. |
+## Use it as a library
 
-Every path the tool prints (in findings, `list`, `dump`, the output of `fix`,
-warnings and errors) is spelled the same however you named it on the command
-line: relative to the current directory, without a leading `./`, when the file
-is inside it, and absolute otherwise. Paths use the separator of the operating
-system, so `src\a.rs` on Windows.
+The engine is published as the `sqlx-sqruff-core` crate: it finds the SQL
+literals in Rust source, and checks or fixes them with sqruff. From 1.0 on, it
+follows semantic versioning for its public API. Its API docs are on
+[docs.rs](https://docs.rs/sqlx-sqruff-core).
 
-Every command prints its results sorted by path, then line, then column. Paths
-are compared one component at a time, so `src/m/x.rs` comes before `src/m.rs`,
-and absolute paths come before relative ones. The `error:` lines on stderr are
-sorted the same way, by the path they name, so naming the same paths in
-another order prints the same lines. The `warning:` and `note:` lines about a
-file come when that file is processed.
+## Documentation
 
-`check` and `fix` end with a summary line on stderr:
-`N finding(s); E error(s).` for `check`, and
-`Q query(ies) in F file(s); N not applied; E error(s).` for `fix`, where with
-`--check` `Q` and `F` count what `fix` would change. `E` is the number of
-`error:` lines printed before it, each of which makes the run exit `2`.
+- [Usage](https://github.com/skyf0l/sqlx-sqruff/blob/main/docs/usage.md): commands, flags, and how `fix` rewrites a query.
+- [Output and exit codes](https://github.com/skyf0l/sqlx-sqruff/blob/main/docs/output.md): the exact format of everything the tool prints, and every error.
+- [Configuration](https://github.com/skyf0l/sqlx-sqruff/blob/main/docs/configuration.md): config file lookup, the dialect, `noqa`, and file selection.
+- [Limitations](https://github.com/skyf0l/sqlx-sqruff/blob/main/docs/limitations.md): which queries are found, and which are not rewritten.
 
-### Config resolution
-
-Mirrors sqruff's own behaviour. sqruff reads every config file it finds in the
-places below and stacks them, so a value set in a later file overrides the same
-value from an earlier one:
-
-1. your user config directory: `~/.config/sqruff` when it exists, otherwise
-   `$XDG_CONFIG_HOME/sqruff` on Linux, `~/Library/Application Support/sqruff`
-   on macOS, or `%LOCALAPPDATA%\sqruff\sqruff` on Windows,
-2. your home directory,
-3. each ancestor of the current directory below your home directory (or below
-   the filesystem root, when the current directory is outside your home
-   directory), outermost first,
-4. the current directory,
-5. `--config FILE`, applied on top of all of them.
-
-In each of those directories sqruff reads `.sqlfluff`, `.sqruff`,
-`.sqruff.ini`, `pyproject.toml` and `sqruff.toml`, in that order. Discovery
-starts from the current directory, not from the files being checked. A
-`.sqruff` at your project root is **the recommended way**: your project owns
-and version-controls it.
-
-sqruff reads only its own sections (`[sqruff]`, `[sqruff:...]`, their
-`sqlfluff` forms, and `[tool.sqruff]` or `[tool.sqlfluff]` in a TOML file).
-When no config file sets an option there and no `--config` is given, sqruff's
-built-in default rules apply, and `check` and `fix` print a `note:` line on
-stderr saying so. This includes a project whose only config file holds just a
-`[sqlx-sqruff]` section, and a run started outside the project: its `.sqruff`
-is not found even when the paths you name are inside it, so the note also says
-that config files are looked up from the current directory.
-
-The only value the tool injects is `dialect`, resolved in this order:
-
-1. `--dialect NAME`, else
-2. the `dialect` set in the config, else
-3. `postgres`, because sqruff's own `ansi` default mis-parses most postgres
-   sqlx queries.
-
-If your queries target another database, for example MySQL or SQLite with `?`
-placeholders, set `dialect` in your `.sqruff`. An unknown dialect name, from
-the config or the flag, is reported as an error.
-
-### Skipping a query
-
-sqruff's inline `noqa` comments work inside the SQL: end a line with
-`-- noqa` to silence every rule on that line, or `-- noqa: CV05` for one rule.
-sqruff does not report a comment that names no rule it knows, such as a
-misspelt one; see the `NOQA` code under [Output](#output).
-
-Since the rules and `.sqruff` format are sqruff's, see its docs directly:
-
-- [Configuration](https://playground.quary.dev/docs/usage/configuration/): `.sqruff` format, sections, per-rule options.
-- [Rules reference](https://playground.quary.dev/docs/reference/rules/): every rule code (`CP01`, `LT01`, ...) and what it does.
-
-### Selecting which files to scan
-
-By default every `.rs` file under the search roots (the paths you name, or the
-current directory) is scanned, respecting `.gitignore`, `.ignore`,
-`.git/info/exclude` and your global git excludes file. `.gitignore` files are
-honoured outside a git repository too. Hidden files and directories (names
-starting with `.`) are skipped, and symbolic links found while walking are not
-followed; a path you name on the command line is always followed. Each file is
-scanned once, even when two of the paths you name contain it.
-
-The ignore files, `exclude` and the hidden-name rule prune only what the walk
-finds inside a search root, never the root itself:
-
-- A **file** you name is always scanned, whatever its extension (so
-  `sqlx-sqruff check build/queries.txt` works), even when it is ignored or
-  excluded.
-- A **directory** you name is walked even when it is ignored, excluded or
-  hidden. With `gen/` in `.gitignore`, `sqlx-sqruff check` and
-  `sqlx-sqruff check .` skip `gen/`, but `sqlx-sqruff check gen` scans it, as
-  does a run started inside `gen/`. A pattern that matches the files or
-  directories inside it, such as `gen/**` or `*.gen.rs`, still prunes them.
-  A directory you name in which nothing is selected is an error (exit `2`);
-  the other paths are still scanned.
-- Files found by walking a directory are scanned only when they end in `.rs`.
-
-To persist a project's scope, add a **`[sqlx-sqruff]`** section to your
-`.sqruff`. sqruff itself ignores this section (it only reads `sqruff` /
-`sqruff:*`), so it is consumed solely by this CLI:
-
-```ini
-[sqruff]
-dialect = postgres
-
-# CLI-only: which .rs files this tool walks.
-[sqlx-sqruff]
-# Whitelist: comma-separated globs, or one per indented line.
-include =
-    src/**/*.rs
-    crates/**/*.rs
-# Always pruned.
-exclude = **/generated/**
-# The default; set it to false to ignore .gitignore and the other ignore files.
-respect_gitignore = true
-```
-
-Where the section is read from:
-
-- The `--config FILE` file, when it has a `[sqlx-sqruff]` section.
-- Otherwise the nearest `.sqruff.ini`, `.sqruff` or `.sqlfluff` file that has
-  one, looking in the current directory and then in each parent directory.
-  Within one directory, `.sqruff.ini` is looked at first, then `.sqruff`, then
-  `.sqlfluff`, because that is the order in which sqruff lets them override
-  each other. A config file without the section, for example a nested
-  `.sqruff` that only sets rules, does not hide the section of a file further
-  up.
-- With no such file, every `.rs` file is scanned as described above.
-
-The section's format:
-
-- Lines starting with `#` or `;` are comments, and so is the rest of a line
-  after a `#` or `;` that follows whitespace (`a.rs  # note`). A `#` or `;`
-  inside a glob, with no whitespace before it, is part of the glob.
-- An indented line continues the value of the key above it, so a long glob
-  list can span several lines.
-- An unknown key is reported with a warning that names the config file. An
-  invalid `respect_gitignore` value is an error (exit `2`); it accepts `true`,
-  `false`, `yes`, `no`, `on`, `off`, `1` and `0`.
-
-Selection rules:
-
-| `include` | `exclude` | Result |
-| --------- | --------- | ------ |
-| unset | unset | every `.rs` (respecting `.gitignore`) |
-| set | unset | only files matching `include` |
-| unset | set | every `.rs` minus `exclude` |
-| set | set | `include` minus `exclude` |
-
-- **Explicit positional paths win.** `sqlx-sqruff check src/foo` scans `src/foo`
-  and ignores `include` (you've named your own scope); `exclude` and
-  `.gitignore` still prune what is found inside it, as described above. A
-  directly-named **file** is always scanned.
-- Globs are gitignore-style (`**` spans directories), matched relative to the
-  directory of the config file that defines them, whatever the current
-  directory and the paths you name. With `exclude = src/generated/**`,
-  `sqlx-sqruff check src` and a run from inside `src/` both skip
-  `src/generated/`.
-
-## Architecture
-
-`crates/core` (library): `extract` (syn + proc-macro2 span -> literal byte spans)
--> `literal` (literal value with per-character source positions, and the SQL
-view given to the linter) -> `sqruff_adapter` (the only file touching
-`sqruff-lib`) -> `engine` (check/fix + writeback, with a value check on every
-rewritten literal and a whole-file re-parse). `crates/cli` is the clap
-front-end: file selection, the `[sqlx-sqruff]` config section and exit codes.
-
-Contributors, human or agent: [AGENTS.md](AGENTS.md) lists the checks to run and
-the rules `fix` must keep.
-
-## Known limitations
-
-- **What is extracted.** The `sqlx::query*!` macros (`query!`, `query_as!`,
-  `query_scalar!`, and their `_unchecked` variants), and the runtime functions
-  `sqlx::query`, `query_as`, `query_scalar` and their `_with` variants, for
-  example `sqlx::query("...")` or `sqlx::query_as::<_, T>("...")`.
-  `sqlx::raw_sql`, `QueryBuilder` and SQL passed straight to an executor method
-  such as `.execute("...")` are not extracted.
-- **The SQL must be a single string literal written in the call.** The query
-  is read from one string literal, so a query string assembled some other way
-  (several literals joined with `+`, as in `sqlx::query!("SELECT a " + "FROM t")`,
-  a `concat!(...)`, a `const`, a variable, `format!`, `AssertSqlSafe(...)`, or
-  runtime concatenation) is not extracted: `check`, `fix`, `list` and `dump`
-  all skip such calls without a warning. The SQL is the first argument, or for
-  `query_as!` and `query_as_unchecked!` the argument after the record type, so
-  bind-argument literals that follow the SQL, including `.bind("...")`, are
-  correctly left alone.
-- **A bare name must be imported from sqlx.** A macro or call written without
-  the `sqlx::` prefix, such as `query!(...)` or `query("...")`, is extracted
-  only when that name is imported from sqlx in the same module or in an
-  enclosing block (`use sqlx::query;`, `use sqlx::{query, query_as};`,
-  `use sqlx::query as q;` or `use sqlx::*;`), because other crates export
-  functions and macros with the same names. An import does not reach other
-  modules, including the modules nested in its own, and a local item with the
-  same name hides a `use sqlx::*;`. A bare macro also counts when the same
-  file has `#[macro_use] extern crate sqlx;` at its top level. Method calls such as
-  `client.query("...")` are never extracted.
-- **A local variable hides an imported function of the same name.** After
-  `use sqlx::query;`, the call in `let query = |text| lookup(text);
-  query("...")` is not extracted. A `let` hides the import from the next
-  statement to the end of its block; a function or closure parameter, for the
-  whole body; a binding in a `match` arm, `if let`, `while let` or `for`
-  pattern, for that arm or body. A variable in an inner block does not hide
-  the import outside that block. As in Rust, an item declared inside a block
-  (a `fn`, `impl`, `trait`, `const` or `static`) does not see the variables of
-  the blocks around it, so they do not hide the import inside that item, while
-  a closure does see them. `sqlx::query("...")` written with its
-  path is still extracted. Variables do not hide macros, so `query!(...)` still
-  counts.
-- **A crate alias counts as sqlx.** After `use sqlx as db;` (in the same module
-  or an enclosing block) or `extern crate sqlx as db;` (at the top level of
-  the same file),
-  `db::query!(...)` and `db::query("...")` are extracted like their `sqlx::`
-  forms.
-- **sqlx re-exported under another path counts.** A path whose last two
-  segments are `sqlx` and a query function or macro name counts, whatever comes
-  before them: `crate::db::sqlx::query!(...)`, `::app::sqlx::query("...")`. So
-  does an import through such a path (`use crate::db::sqlx::query;`). A module
-  of your own named `sqlx` with a function named `query` is therefore taken for
-  sqlx. An alias of sqlx reached through a longer path, such as
-  `crate::db::query(...)` when `db` is sqlx renamed, is not recognised.
-- **Macros whose arguments are not Rust expressions are searched by their
-  tokens.** In a macro such as `tokio::select! { r = sqlx::query!("...").fetch_one(&pool) => r }`,
-  every `PATH!(...)` and `PATH(...)` among its tokens is checked with the rules
-  above, and each `{ ... }`, `( ... )` or `[ ... ]` group that parses as a Rust
-  block or list of expressions is read as Rust. Variables that the macro's own
-  syntax binds (the `r` in `r = ...`) are not known there, so they do not hide
-  an imported function.
-- **In a `macro_rules!` body, only a path ending in `sqlx::NAME` counts**, such
-  as `sqlx::query!(...)`, `::sqlx::query("...")` or
-  `$crate::db::sqlx::query!(...)`. A bare name or a crate alias is not
-  recognised there, because the paths in a macro body are resolved where the
-  macro is used, not where it is defined. The SQL must be a string literal
-  written in the body: `sqlx::query!($sql)` has no SQL to read.
-- **`SET` statements are skipped.** A query whose SQL starts with the word
-  `SET` followed by a space (in any case, after any leading whitespace), such
-  as `SET LOCAL app.user_id = ...`, is neither linted nor fixed.
-- **Normal strings with other escapes are not rewritten.** A normal `"..."`
-  string that uses escape sequences other than `\"` and `\\` (for example `\n`,
-  `\x41`, `\u{...}`, or a `\` line continuation) is linted, but `fix` never
-  rewrites it, and `fix --check` fails when such a query needs changes. Write
-  the query as a raw string (`r#"..."#`) to let `fix` format it.
-- **Nested indentation needs block layout.** When the first SQL line sits
-  right after the opening quote, the indent that all following lines share is
-  removed before linting and added back by `fix`, so the least indented of
-  those lines stays where you put it. If a layout rule such as `LT02` wants
-  every following line indented further, as in
-  `"SELECT a FROM t WHERE\n            b = 1"`, applying that would only grow
-  the shared indent on every run. `fix` then leaves the query unchanged, warns
-  that fixing it again would change it further, and counts it as not applied,
-  so `fix --check` fails and `check` keeps reporting the rule. Start the SQL on
-  its own line instead (`r#"`, newline, SQL) to let `fix` lay out the
-  indentation. A query whose SQL already starts on its own line, or is all on
-  one line (even when the closing quote is on the next line), gets this
-  warning only when sqruff's own fixes do not settle on it; the warning then
-  says to disable one of the rules it names instead.
-- **Whitespace-only lines reach sqruff as written.** The Rust indentation is
-  removed from each SQL line before linting and added back by `fix`, but a line
-  that holds only whitespace is left exactly as it is, because it can be part
-  of a SQL string value. A whitespace-only line outside a string value, such as
-  an indented blank line between two clauses, is therefore reported by `LT01`
-  as trailing whitespace, and `fix` empties it.
-- **Unparsable Rust is an error for the whole file.** If `syn` cannot parse a
-  file, none of its queries are read. Every command reports the file on an
-  `error: <path>:<line>:<col>: cannot parse as Rust: ...` line, at the position
-  of `syn`'s error (for a bracket that is never closed, that bracket; for an
-  error at the end of the file, just after its last token), goes on with the
-  other files, and exits `2`. This holds for every file you name on the command
-  line, and for every file found by walking a directory that contains the text
-  `query`. A file found by walking a directory that does not contain the text
-  `query` is not parsed at all, because it cannot hold a query, so it is never
-  reported, even when it is not valid Rust.
-
-Note: apart from the imports a bare name needs, a query's location doesn't
-matter. A `sqlx::query!` or `sqlx::query("...")` inside a function body,
-`impl`, closure, `macro_rules!` body, or the arguments of another macro (such
-as `assert!`, `vec!`, `tokio::try_join!` or `tokio::select!`) is picked up just
-the same.
+These links show the `main` branch, which can describe changes that are not
+released yet. For the docs of your version, open the `docs` folder at its tag,
+for example `https://github.com/skyf0l/sqlx-sqruff/tree/v1.0.0/docs`.
 
 ## License
 
 Licensed under either of
 
 - Apache License, Version 2.0
-  ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
+  ([LICENSE-APACHE](https://github.com/skyf0l/sqlx-sqruff/blob/main/LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
 - MIT license
-  ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+  ([LICENSE-MIT](https://github.com/skyf0l/sqlx-sqruff/blob/main/LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
 
 at your option.
 
-## Releasing
-
-The CLI (`sqlx-sqruff`) and the library (`sqlx-sqruff-core`) share one version:
-`version` under `[workspace.package]` in the root `Cargo.toml`. From 1.0 on, the
-library follows semantic versioning for its public API. Every release publishes
-both crates, so the version must be new for both.
-
-1. Set `version` under `[workspace.package]` in the root `Cargo.toml`, and the
-   same version on the `sqlx-sqruff-core` dependency under
-   `[workspace.dependencies]` in that file. Merge to `main`.
-2. Tag that commit `v<version>` (for example `v1.0.0`) and push the tag.
-
-The `Release` workflow then runs the full CI and checks, before publishing
-anything, that:
-
-- the tagged commit is on `main`,
-- the tag matches the version,
-- neither crate's version is on crates.io yet, so a release that reuses a
-  published version fails here instead of halfway through the publish.
-
-It then publishes both crates to crates.io (library first) through trusted
-publishing, creates the GitHub release and attaches the binaries.
-
-If the `publish` job fails after the library was uploaded, for example on a
-network error while uploading the CLI, open the workflow run and choose
-**Re-run failed jobs**. That re-runs only the failed job and the jobs after
-it. The `publish` job skips a crate whose version is already on crates.io, so
-it resumes with the CLI. Do not choose **Re-run all jobs**: the version check
-would then fail, because the library version is already published.
-
 ## Contribution
+
+For human and agent contributors, [AGENTS.md](https://github.com/skyf0l/sqlx-sqruff/blob/main/AGENTS.md)
+lists the checks to run and the rules `fix` must keep. See also the
+[architecture](https://github.com/skyf0l/sqlx-sqruff/blob/main/docs/architecture.md)
+and the [release steps](https://github.com/skyf0l/sqlx-sqruff/blob/main/docs/releasing.md).
 
 Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
